@@ -9,7 +9,7 @@ Server table:
 groundwater.ChemistryResults
 ```
 
-(accessed via `whEPHT_AHSSQLW01P_OS.sde` — an internal ArcGIS SDE connection)
+(accessed via an internal ArcGIS SDE connection file)
 
 This is the **system of record** for every analyte test submitted to the state,
 across all water source types (private well, spring, public/municipal, surface

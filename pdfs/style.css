@@ -1,0 +1,132 @@
+@page {
+  margin: 0.85in 0.75in;
+}
+
+html {
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+body {
+  font-family: "Segoe UI", -apple-system, "Helvetica Neue", Arial, sans-serif;
+  font-size: 10.5pt;
+  line-height: 1.55;
+  color: #1b1f23;
+  max-width: 7.5in;
+  margin: 0 auto;
+}
+
+h1, h2, h3, h4 {
+  font-family: "Segoe UI Semibold", "Segoe UI", Arial, sans-serif;
+  color: #0b3d63;
+  line-height: 1.25;
+}
+
+h1 {
+  font-size: 20pt;
+  border-bottom: 3px solid #0b3d63;
+  padding-bottom: 8px;
+  margin-top: 0;
+}
+
+h2 {
+  font-size: 14pt;
+  border-bottom: 1px solid #d0d7de;
+  padding-bottom: 4px;
+  margin-top: 26px;
+}
+
+h3 {
+  font-size: 11.5pt;
+  margin-top: 18px;
+  color: #155a8a;
+}
+
+p, li {
+  font-size: 10.5pt;
+}
+
+a {
+  color: #0969da;
+  text-decoration: none;
+}
+
+code {
+  font-family: "Cascadia Code", "Consolas", "Courier New", monospace;
+  background: #f3f4f6;
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-size: 9.3pt;
+  color: #8a2be2;
+}
+
+pre {
+  background: #f6f8fa;
+  border: 1px solid #d0d7de;
+  border-left: 4px solid #0b3d63;
+  border-radius: 4px;
+  padding: 10px 14px;
+  overflow-x: auto;
+  page-break-inside: avoid;
+}
+
+pre code {
+  background: none;
+  padding: 0;
+  color: #1b1f23;
+  font-size: 9pt;
+  line-height: 1.5;
+}
+
+blockquote {
+  border-left: 4px solid #f0a500;
+  margin: 12px 0;
+  padding: 2px 14px;
+  background: #fff9ec;
+  color: #444;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 12px 0 18px 0;
+  font-size: 9.5pt;
+  page-break-inside: avoid;
+}
+
+th, td {
+  border: 1px solid #d0d7de;
+  padding: 6px 10px;
+  text-align: left;
+}
+
+th {
+  background: #0b3d63;
+  color: #ffffff;
+  font-weight: 600;
+}
+
+tr:nth-child(even) td {
+  background: #f6f8fa;
+}
+
+hr {
+  border: none;
+  border-top: 1px solid #d0d7de;
+  margin: 24px 0;
+}
+
+ul, ol {
+  padding-left: 22px;
+}
+
+.title-block {
+  margin-bottom: 4px;
+}
+
+.subtitle-meta {
+  color: #57606a;
+  font-size: 9pt;
+  margin-top: -4px;
+  margin-bottom: 20px;
+}
