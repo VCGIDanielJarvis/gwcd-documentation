@@ -29,7 +29,8 @@ Changelog:
 01/23/23  - Created - Victoria Treto
 11/01/23  - Finalized - Victoria Treto
 3/24/2025 - Rewritten - Daniel Jarvis
-11/09/2026 - Rewritten for readability and maintainability, at Daniel Jarvis's request:
+11/09/2026 - Rewritten for readability and maintainability, at Daniel Jarvis's request
+             with assistance from Claude AI:
     - Reorganized the whole script into small, documented functions instead of one long
       linear script.
     - Consolidated the two copies of the "exclude school/daycare/public-water-system/
