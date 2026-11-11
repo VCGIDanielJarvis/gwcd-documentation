@@ -1,7 +1,9 @@
 # Filtering Criteria
 
 This is the scope filter applied before exceedance calculation and
-aggregation (`calculationSelection` in the production script). Any dashboard
+aggregation (`build_published_record_filter_clause()` in the production
+script — one shared function, called from both the exceedance-calculation step
+and the final publish step, so the two can never disagree). Any dashboard
 computing exceedance/detection rates from this data should apply the same
 filter to stay aligned with the public map.
 
@@ -22,9 +24,14 @@ filter to stay aligned with the public map.
   `SamplingLocationDescription` (school/daycare/VDH laboratory language).
 - **Pre-treatment only**: excludes `PostTreatmentSample = 'Y'` (i.e., samples
   taken after a water treatment system — only raw/untreated water counts).
+- **Resolvable Vermont town required**: excludes records with no `TOWNNAME`
+  (couldn't be geocoded at all, or landed outside every town boundary). See
+  [05-geocoding.md](05-geocoding.md) for how those records are tracked instead
+  of just silently disappearing.
 
-All of the above are NULL-safe: a NULL in any of these fields does **not**
-exclude the record (only an explicit disqualifying value does).
+All of the above except the town requirement are NULL-safe: a NULL in any of
+those fields does **not** exclude the record (only an explicit disqualifying
+value does).
 
 ## Pseudo-code
 
@@ -32,7 +39,7 @@ exclude the record (only an explicit disqualifying value does).
 INCLUDE record IF:
     (Result IS NULL OR LOWER(Result) NOT IN [
         "rejected", "na", "n/a", "rejection", "no data", "nd",
-        "not tested", "nda", "error", "see attached", ""
+        "not tested", "nda", "error", "error in result", "see attached", ""
     ])
     AND (WHCombinedResult IS NULL OR LOWER(WHCombinedResult) NOT IN [same list as above])
     AND (WaterSource IS NULL OR LOWER(WaterSource) NOT IN [
@@ -50,6 +57,7 @@ INCLUDE record IF:
         "district", "childhood", "uvmmc", "early ed", "uvm-", "vdh laboratory"
     ])
     AND (PostTreatmentSample IS NULL OR LOWER(PostTreatmentSample) = "n")
+    AND (TOWNNAME IS NOT NULL)
 ```
 
 ## Analyte name normalization
@@ -68,7 +76,7 @@ AnalyteAlias = LOOKUP(LOWER(TRIM(AnalyteName)), analyte_alias_dictionary)
 IF no match: AnalyteAlias = NULL   # record excluded from analyte/town grouping
 ```
 
-Full dictionary is in the sanitized script (`analyteDictionary`).
+Full dictionary is in the sanitized script (`ANALYTE_NAME_STANDARDIZATION`).
 
 ## Deduplication (applied after the above filter, before aggregation)
 

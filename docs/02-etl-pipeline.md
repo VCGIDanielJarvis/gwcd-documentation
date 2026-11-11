@@ -1,7 +1,9 @@
 # ETL Pipeline Walkthrough
 
-Source: `GroundwaterChemistryDatabasePROD.py` (runs weekly). Line numbers below
-refer to the sanitized copy in [scripts/](../scripts/GroundwaterChemistryDatabasePROD.sanitized.py).
+Source: `GroundwaterChemistryDatabasePROD_updated.py` (runs weekly via FME Flow —
+see [07-automation.md](07-automation.md)). See the sanitized copy in
+[scripts/](../scripts/GroundwaterChemistryDatabasePROD.sanitized.py) for the real
+logic; its own module docstring lists every destination this script writes to.
 
 ## 1. Load raw data
 
@@ -32,8 +34,9 @@ notification tool, separate from the public map/dashboard data below.
   the state's E911 composite locator.
 - Records that fail to geocode an address are retried using **just the town
   name**, geocoded to a **town centroid**.
-- Records that fail both are dropped from the geocoded/mapped product (they
-  still exist in the raw table from step 1).
+- Records that fail both passes are **kept, not dropped** — they're tagged (via
+  the reused `ConcatAddress` field) with a plain-language reason instead, so
+  they stay visible for internal review. See [05-geocoding.md](05-geocoding.md).
 - All geocoded points (address-level + centroid fallback) are spatially joined
   to town boundaries to assign `TOWNNAME`.
 
@@ -45,8 +48,12 @@ state- vs. town-level analysis.
 Before any exceedance math, records are restricted to the private drinking
 water scope: valid/non-error results, private well/spring water sources only
 (excludes public/municipal/surface water), non-institutional clients (schools,
-daycares, VDH internal proficiency tests excluded), and non-post-treatment
-samples. Full logic in [03-filtering-criteria.md](03-filtering-criteria.md).
+daycares, VDH internal proficiency tests excluded), non-post-treatment
+samples, and a resolvable Vermont town. This single filter clause
+(`build_published_record_filter_clause()`) is shared verbatim between the
+exceedance-calculation step and the final publish step, so the two can never
+disagree with each other. Full logic in
+[03-filtering-criteria.md](03-filtering-criteria.md).
 
 ## 6. Exceedance calculation
 
@@ -67,7 +74,7 @@ Grouped by (`AnalyteAlias`, `TOWNNAME`), compute: sample count, count/percent
 above each threshold type, and mean/median/min/max/95th percentile/standard
 deviation of the result value.
 
-## 9. Write outputs
+## 9. Write the map/dashboard outputs
 
 - Full set (deduplicated, with stats) → `GroundwaterChemistry_GWCDPoints`.
 - Public set → `GroundwaterChemistry_GWCDPointTableExternal`: same data, with
@@ -76,8 +83,21 @@ deviation of the result value.
   for 6 specific analytes (Arsenic, Fluoride, Gross Alpha, Nitrate, Radon,
   Uranium) — see [06-application.md](06-application.md).
 
-## 10. Housekeeping
+## 10. Privileged internal review export
+
+Characterizes every record in `GroundwaterChemistry_GWCDPoints` whose address
+didn't geocode to a real street-level match (geocode failures and
+town-centroid-only fallbacks) and republishes it as the
+`GroundwaterChemistry_ExcludedRecords` CSV on ArcGIS Online — full schema, plus
+longitude/latitude and a plain-language `GeocodeOutcome` column. See
+[05-geocoding.md](05-geocoding.md).
+
+## 11. Housekeeping
 
 Rebuilds table indexes, updates a "last data refresh" timestamp in a
 SharePoint list (via Microsoft Graph API), and publishes a pivoted
-(long-to-wide) CSV export of all results to ArcGIS Online for internal use.
+(long-to-wide) CSV export of all results (`PivotedGroundwaterData`) to ArcGIS
+Online for internal use. Both the SharePoint update and the two AGOL CSV
+publishes are wrapped in error handling — a transient failure here is logged
+as a warning and does not fail the overall job, since the core SDE/map data has
+already been successfully published by this point.

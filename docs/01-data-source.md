@@ -19,7 +19,8 @@ drinking water use case at all.
 
 ## Weekly load
 
-Every week, `GroundwaterChemistryDatabasePROD.py`:
+Every week, `GroundwaterChemistryDatabasePROD_updated.py` — triggered by an FME
+Flow schedule, see [07-automation.md](07-automation.md) — runs:
 
 1. Truncates and reloads a GIS-side staging table,
    `GroundwaterChemistry_GWCDrawdata`, with a 1:1 column copy of
@@ -30,12 +31,19 @@ Every week, `GroundwaterChemistryDatabasePROD.py`:
    geocoding, exceedance calculation, and aggregation (see
    [02-etl-pipeline.md](02-etl-pipeline.md)) against an in-memory copy of that
    table.
-3. Writes two downstream products:
+3. Writes downstream products:
    - `GroundwaterChemistry_GWCDPoints` — filtered to the private drinking water
-     scope, geocoded, with exceedance flags and per-town/analyte summary stats.
+     scope, geocoded (or tagged, not dropped, where it couldn't be), with
+     exceedance flags and per-town/analyte summary stats.
    - `GroundwaterChemistry_GWCDPointTableExternal` — the public-facing version
      of the above, deduplicated per location and suppressed for small sample
-     sizes. This is what feeds the Experience Builder app.
+     sizes. This is what feeds the Public Experience Builder app.
+   - Two ArcGIS Online CSV exports (`PivotedGroundwaterData` and
+     `GroundwaterChemistry_ExcludedRecords`) for internal use — see
+     [05-geocoding.md](05-geocoding.md).
+
+See [00-architecture.md](00-architecture.md) for a diagram of every input and
+output this script touches, including the two Experience Builder apps.
 
 ## Alias/reference tables used during cleaning
 

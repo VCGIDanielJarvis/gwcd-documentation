@@ -1,51 +1,123 @@
 # ============================================================================
 # SANITIZED COPY - for documentation purposes only.
-# Internal server/SDE connection paths, credential file paths, staff email
-# addresses, and Azure AD app registration secrets have been redacted/replaced
-# with placeholders below. This is not a runnable copy of the production
-# script. See ../docs/ for a guided walkthrough of this logic.
+# Internal server/SDE connection paths, credential file paths, and staff email
+# addresses have been redacted/replaced with placeholders below. This is not a
+# runnable copy of the production script. See ../docs/ for a guided walkthrough
+# of this logic.
 # ============================================================================
 
-# for recorduid = 507051, in the final points dataset, the SamplePhysicalAddressCity is set to Athens, but
-# a joined value for TOWNNAME and TOWNNAMEMC is set to Townshend.  This needs to be investigated. There are other examples like this.
-
-
 """
-To Do:
-Get Kristine:
- - a list of all analytes and the labs they come from
- - a list of records with other problems, like addresses
- - more
-
-
-
-
-
- Title:
+Title:
 Groundwater Chemistry Database Private Drinking Water Application Script
 
 File Name:
-GWCD_PUB.py
+GroundwaterChemistryDatabasePROD_updated.py
 
 Description:
-
-This script should run on a weekly basis
-to maintain and update the public-facing web application for the display of private
-drinking water exceedances by town and analyte.
-
-Created by Victoria Treto (victoria.treto@vermont.gov)
+This script runs on a weekly basis to maintain and update the public-facing web
+application that displays private drinking water exceedances by town and analyte.
+Along the way it also:
+  - mirrors raw lab results from SQL Server into an internal SDE table,
+  - emails a weekly "did anything exceed a safety threshold in the last 7 days" report,
+  - geocodes and cleans up sample locations, standardizes analyte/town/water-source names,
+  - computes per-record and per-town/analyte exceedance statistics,
+  - publishes the internal (full) and external (public, suppressed) results to SDE,
+  - updates a "data last refreshed" date on a SharePoint list, and
+  - republishes a long-to-wide pivoted CSV export to ArcGIS Online.
 
 Changelog:
 01/23/23  - Created - Victoria Treto
 11/01/23  - Finalized - Victoria Treto
 3/24/2025 - Rewritten - Daniel Jarvis
+11/09/2026 - Rewritten for readability and maintainability, at Daniel Jarvis's request:
+    - Reorganized the whole script into small, documented functions instead of one long
+      linear script.
+    - Consolidated the two copies of the "exclude school/daycare/public-water-system/
+      rejected-result" filter into one shared function. The two copies had quietly drifted
+      apart (one excluded WHCombinedResult = 'error in result', the other didn't), so a
+      record in that state could skip the exceedance calculation step but still end up
+      published. Both places now call build_published_record_filter_clause().
+    - Added basic error handling around the SharePoint and ArcGIS Online publish steps at
+      the very end of the script. Those are not critical to the main data pipeline, so a
+      transient network hiccup there now prints a warning and moves on instead of crashing
+      the whole job and hiding the fact that everything before it already succeeded.
+    - Moved the Azure AD app credentials out of the script and into a creds file
+      (azureCredsFile below), matching the existing pattern used for the AGO credentials.
+      NOTE: this is a stopgap - the plan is to move all creds files into KeePass later.
+    - Accepted a brief "table is empty" window during the nightly refresh (delete-then-
+      append) as a known, acceptable tradeoff since this job only runs overnight.
 
-ADDED MUNICIPAL TO THE WATER SOURCE FILTER - is this ok to remove?
+-------------------------------------------------------------------------------------
+OPEN ITEMS (carried over from the previous version of this script - still not resolved):
+
+- For recorduid = 507051, in the final points dataset, SamplePhysicalAddressCity is set to
+  "Athens", but the joined TOWNNAME / TOWNNAMEMC comes back as "Townshend". This needs to
+  be investigated - there are other examples like this.
+
+- To Do / Get Kristine:
+    - a list of all analytes and the labs they come from
+    - a list of records with other problems, like addresses
+    - more
+
+- "ADDED MUNICIPAL TO THE WATER SOURCE FILTER" - is this ok to remove?
+-------------------------------------------------------------------------------------
+
+WHAT THIS SCRIPT PRODUCES / UPDATES (final destinations - see also the per-step comments
+inside main() below for which step updates which of these):
+
+- SDE table GDB_ENVHEALTH_ADMIN.GroundwaterChemistry_GWCDrawdata (RAW_DATA_TABLE)
+    Full, unfiltered mirror of the SQL Server source - every raw lab record, nothing
+    filtered or geocoded yet. Feeds the "Raw Data (GWCD) - Internal" layer in the
+    Internal experience below.
+
+- SDE feature class GDB_ENVHEALTH_ADMIN.GroundwaterChemistry_GWCDPoints (POINTS_FEATURE_CLASS)
+    Every record, geocoded where possible (tagged instead of dropped where it isn't),
+    with exceedance calculations applied. Feeds the "Geocoded GWCD Points - Internal"
+    layer in the Internal experience below, and is the source table for both the
+    pivoted CSV export and the excluded-records report.
+
+- SDE table GDB_ENVHEALTH_ADMIN.GroundwaterChemistry_GWCDPointTableExternal (EXTERNAL_PUBLIC_TABLE)
+    Filtered, small-sample-suppressed, town/analyte summary table. Feeds BOTH the
+    "Analyte Data - External" layer in the Internal experience AND the live public
+    ArcGIS Server service backing the Public experience below. This table is read live
+    and dynamically with no caching - changes here are visible to the public within
+    one request, no lag.
+
+- ArcGIS Online item "PivotedGroundwaterData" (CSV, "AHS_VDH_EnvHealth_GroundwaterInternal"
+  folder)
+    Long-to-wide pivoted export of POINTS_FEATURE_CLASS, for internal analysis only -
+    not used by either experience below.
+
+- ArcGIS Online item "GroundwaterChemistry_ExcludedRecords" (CSV,
+  "AHS_VDH_EnvHealth_GroundwaterInternal" folder)
+    Every record whose address did not geocode to a real street-level match: records
+    that failed to geocode entirely, and records that only reached their town's centroid
+    (lower spatial precision; these still count toward the public map's statistics). For
+    privileged internal review of geocoding precision only - not used by either
+    experience below.
+
+- SharePoint list item, "LatestDataUpdate" field, Groundwater Chemistry application
+  domain (AHS.GISAdministrationGroup site, list id in SHAREPOINT_LIST_ID)
+    Lets staff see at a glance when this data was last refreshed.
+
+- Internal Experience Builder app, "Drinking Water Quality - Internal" (private,
+  staff-only group):
+    https://experience.arcgis.com/experience/860a6e275d9c4f72aa2acc138e0a0880
+  Shows the full, unfiltered internal picture: raw data, full geocoded points
+  (including records that failed to geocode), and the external/analyte summary layer.
+
+- Public Experience Builder app, "Drinking Water Quality" (public, ~18k views):
+    https://experience.arcgis.com/experience/dbed7d7f37ff4927a8edda677696b7c4
+  IMPORTANT: this app has three pages, and only ONE of them is fed by this script -
+  "Private Drinking Water Quality" (the 6 analyte tabs: Arsenic, Fluoride, Gross Alpha,
+  Nitrate, Radon, Uranium). The other two pages, "System Level Public Drinking Water
+  Quality" and "State Level Public Drinking Water Quality", are embedded Power BI
+  reports on an entirely separate VT DEC public-water-system data pipeline - this
+  script has no effect on them whatsoever.
+-------------------------------------------------------------------------------------
 """
 
-
 # ----------------------------------- Module Imports ----------------------------
-# standard library + third party modules
 import arcpy
 from collections import defaultdict
 import numpy as np
@@ -55,7 +127,7 @@ import requests
 import pandas as pd
 import tempfile
 import zipfile
-from arcgis.gis import GIS
+from arcgis.gis import GIS, ItemProperties, ItemTypeEnum
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -65,1308 +137,1566 @@ import csv
 import html
 
 
-# ----------------------------------- paths -------------------------------------
-# main paths
-# NOTE: internal server/SDE connection paths redacted for this public-facing copy.
-GDBEnvHealthEditor = "<SDE_CONNECTION_PATH>/EnvHealth_PROD_Editor.sde"
-groundwaterChemistryDatabaseGISTable = f"{GDBEnvHealthEditor}/GDB_ENVHEALTH_ADMIN.GroundwaterChemistry_GWCDrawdata"
-groundwaterChemistryDatabaseGISAliasTable = f"{GDBEnvHealthEditor}/GDB_ENVHEALTH_ADMIN.GroundwaterChemistryAliasTable"
-groundwaterChemistryDatabaseGISPoints = f"{GDBEnvHealthEditor}/GDB_ENVHEALTH_ADMIN.GroundwaterChemistry_GWCDPoints"
-groundwaterChemistryDatabaseGISPointTableExternal = f"{GDBEnvHealthEditor}/GDB_ENVHEALTH_ADMIN.GroundwaterChemistry_GWCDPointTableExternal"
-townBounds = f"{GDBEnvHealthEditor}/GDB_ENVHEALTH_ADMIN.GroundwaterChemistry_TownBounds"
+# =====================================================================================
+# CONFIGURATION - data sources, destinations, and other settings.
+# These external paths/names/schemas must stay exactly as-is: other applications
+# (ArcGIS Server map services, two public ArcGIS Experience Builder apps, and a
+# SharePoint list) read directly from these tables and fields.
+# =====================================================================================
 
-groundwaterChemistryDatabaseSQLDB = "<SDE_CONNECTION_PATH>/<SQL_CONNECTION_FILE>.sde"
-groundwaterChemistryDatabaseSQLTable = f"{groundwaterChemistryDatabaseSQLDB}/groundwater.ChemistryResults"
-E911GeocoderService = "https://maps.vcgi.vermont.gov/arcgis/rest/services/EGC_services/GCS_E911_COMPOSITE_SP_v2/GeocodeServer/GCS_E911_COMPOSITE_SP_v2"
-agoCredsFile = "<REDACTED_CREDENTIALS_FILE_PATH>"
+GIS_EDITOR_CONNECTION = "<SDE_CONNECTION_PATH>/EnvHealth_PROD_Editor.sde"
 
-# --- Email Configuration ---
-# NOTE: real staff addresses redacted for this public-facing copy.
+RAW_DATA_TABLE = f"{GIS_EDITOR_CONNECTION}/GDB_ENVHEALTH_ADMIN.GroundwaterChemistry_GWCDrawdata"
+TOWN_ALIAS_TABLE = f"{GIS_EDITOR_CONNECTION}/GDB_ENVHEALTH_ADMIN.GroundwaterChemistryAliasTable"
+POINTS_FEATURE_CLASS = f"{GIS_EDITOR_CONNECTION}/GDB_ENVHEALTH_ADMIN.GroundwaterChemistry_GWCDPoints"
+EXTERNAL_PUBLIC_TABLE = f"{GIS_EDITOR_CONNECTION}/GDB_ENVHEALTH_ADMIN.GroundwaterChemistry_GWCDPointTableExternal"
+TOWN_BOUNDARIES = f"{GIS_EDITOR_CONNECTION}/GDB_ENVHEALTH_ADMIN.GroundwaterChemistry_TownBounds"
+
+SQL_SOURCE_DATABASE = "<SDE_CONNECTION_PATH>/<SQL_CONNECTION_FILE>.sde"
+SQL_SOURCE_TABLE = f"{SQL_SOURCE_DATABASE}/groundwater.ChemistryResults"
+
+E911_GEOCODER_URL = "https://maps.vcgi.vermont.gov/arcgis/rest/services/EGC_services/GCS_E911_COMPOSITE_SP_v2/GeocodeServer/GCS_E911_COMPOSITE_SP_v2"
+
+AGO_CREDS_FILE = "<REDACTED_CREDENTIALS_FILE_PATH>"
+
+# format is: client_id,client_secret,tenant_id
+AZURE_CREDS_FILE = "<REDACTED_CREDENTIALS_FILE_PATH>"
+
 EMAIL_SENDER = "<REDACTED_SENDER_ADDRESS>"
-EMAIL_RECIPIENTS = ["<REDACTED_RECIPIENT_1>", "<REDACTED_RECIPIENT_2>", "<REDACTED_RECIPIENT_3>", "<REDACTED_RECIPIENT_4>"]
+EMAIL_RECIPIENTS = [
+    "<REDACTED_RECIPIENT_1>",
+    "<REDACTED_RECIPIENT_2>",
+    "<REDACTED_RECIPIENT_3>",
+    "<REDACTED_RECIPIENT_4>",
+]
 
-# Get AGO EnvHealth Credentials
-# NOTE: credential loading redacted. In production this reads a username/password
-# pair from a secured, access-restricted local file - no secrets are hardcoded here.
-agoUsername = "<REDACTED>"
-agoPassword = "<REDACTED>"
+SHAREPOINT_SITE_URL = "vermontgov.sharepoint.com:/teams/AHS.GISAdministrationGroup"
+SHAREPOINT_LIST_ID = "<REDACTED_LIST_ID>"
+SHAREPOINT_APPLICATION_DOMAIN = "Groundwater Chemistry"
 
-# Appending Raw GWCD Data to GIS Table GWCDrawdata
-arcpy.management.DeleteRows(groundwaterChemistryDatabaseGISTable)
+AGOL_PORTAL_URL = "https://ahs-vt.maps.arcgis.com/"
+PIVOTED_CSV_ITEM_TITLE = "PivotedGroundwaterData"
+# The AGOL folder that both CSV items (PivotedGroundwaterData and
+# GroundwaterChemistry_ExcludedRecords) live in.
+PIVOTED_CSV_FOLDER_NAME = "AHS_VDH_EnvHealth_GroundwaterInternal"
 
-fields = {'AdditionalEmail': 'AdditionalEmail', 'AnalysisType': 'AnalysisType', 
-          'AnalyteName': 'AnalyteName', 'AnalyzedAmount': 'AnalyzedAmount', 
-          'AnalyzedAmountUnit': 'AnalyzedAmountUnit', 'AnalyzedDateTime': 'AnalyzedDateTime', 
-          'CAS_RegistryNumber': 'CAS_RegistryNumber', 'Chlorinated': 'Chlorinated', 
-          'ClientEmail': 'ClientEmail', 'ClientMailingAddressCity': 'ClientMailingAddressCity', 
-          'ClientMailingAddressLine1': 'ClientMailingAddressLine1', 'ClientMailingAddressLine2': 'ClientMailingAddressLine2', 
-          'ClientMailingAddressState': 'ClientMailingAddressState', 'ClientMailingAddressZip': 'ClientMailingAddressZip', 
-          'ClientName': 'ClientName', 'ClientNotes': 'ClientNotes', 
-          'ClientPhoneNumber': 'ClientPhoneNumber', 'Composite': 'Composite', 
-          'DilutionFactor': 'DilutionFactor', 'FileName': 'FileName', 
-          'FilePosition': 'FilePosition', 'InsertDate': 'InsertDate', 
-          'InsertUser': 'InsertUser', 'LabCertificationExpirationDate': 'LabCertificationExpirationDate', 
-          'LabContact': 'LabContact', 'LabContactEmail': 'LabContactEmail', 
-          'LabMailingAddressCity': 'LabMailingAddressCity', 'LabMailingAddressLine1': 'LabMailingAddressLine1', 
-          'LabMailingAddressLine2': 'LabMailingAddressLine2', 'LabMailingAddressState': 'LabMailingAddressState', 
-          'LabMailingAddressZip': 'LabMailingAddressZip', 'LabName': 'LabName', 
-          'LabQualifiersDefinition': 'LabQualifiersDefinition', 'LastUpdateDate': 'LastUpdateDate', 
-          'LastUpdateUser': 'LastUpdateUser', 'PostTreatmentSample': 'PostTreatmentSample', 
-          'Preservative': 'Preservative', 'QualifiersAndNotes': 'QualifiersAndNotes', 
-          'ReceivedDateTime': 'ReceivedDateTime', 'Record_uid': 'Record_uid', 
-          'RejectionReason': 'RejectionReason', 'ReportType': 'ReportType', 
-          'ReportedDateTime': 'ReportedDateTime', 'ReportingLimit': 'ReportingLimit', 
-          'ReportingLimitType': 'ReportingLimitType', 'ReportingLimitUnit': 'ReportingLimitUnit', 
-          'Result': 'Result', 'ResultType': 'ResultType', 'ResultUncertainty': 'ResultUncertainty', 
-          'ResultUnit': 'ResultUnit', 'SPAN': 'SPAN', 'SampleAmount': 'SampleAmount', 
-          'SampleAmountUnit': 'SampleAmountUnit', 'SampleCollectionDateTime': 'SampleCollectionDateTime', 
-          'SampleCollector': 'SampleCollector', 'SampleFinishTime': 'SampleFinishTime', 
-          'SampleFinishVolume': 'SampleFinishVolume', 'SampleFinishVolumeUnit': 'SampleFinishVolumeUnit', 
-          'SampleLatitude': 'SampleLatitude', 'SampleLatitudeLongitudeFormat': 'SampleLatitudeLongitudeFormat', 
-          'SampleLocationPhysicalAddressCity': 'SampleLocationPhysicalAddressCi', 
-          'SampleLocationPhysicalAddressLine1': 'SampleLocationPhysicalAddress1', 
-          'SampleLocationPhysicalAddressLine2': 'SampleLocationPhysicalAddress2', 
-          'SampleLocationPhysicalAddressState': 'SampleLocationPhysicalAddressSt', 
-          'SampleLocationPhysicalAddressZip': 'SampleLocationPhysicalAddressZi', 
-          'SampleLongitude': 'SampleLongitude', 'SampleStartTime': 'SampleStartTime', 
-          'SampleStartVolume': 'SampleStartVolume', 'SampleStartVolumeUnit': 'SampleStartVolumeUnit', 
-          'SampleTemperature': 'SampleTemperature', 'SampleTemperatureUnit': 'SampleTemperatureUnit', 
-          'SampleVolume': 'SampleVolume', 'SampleVolumeUnit': 'SampleVolumeUnit', 
-          'SampleWeight': 'SampleWeight', 'SampleWeightUnit': 'SampleWeightUnit', 
-          'SamplingLocationDescription': 'SamplingLocationDescription', 
-          'SubcontractedResults': 'SubcontractedResults', 'TestMethodCode': 'TestMethodCode', 
-          'TestMethodName': 'TestMethodName', 'Test_id': 'Test_id', 
-          'VT_StateLab_id': 'VT_StateLab_id', 'VT_WellTag_id': 'VT_WellTag_id', 
-          'WHCombinedResult': 'WHCombinedResult', 'WHResultType': 'WHResultType', 
-          'WHResultUncertainty': 'WHResultUncertainty', 'WHResultValueAlpha': 'WHResultValueAlpha', 
-          'WHResultValueNumeric': 'WHResultValueNumeric', 'WaterSource': 'WaterSource', 'pH': 'pH'}
 
-with arcpy.da.InsertCursor(groundwaterChemistryDatabaseGISTable, list(fields.values())) as insertCursor:
-    with arcpy.da.SearchCursor(groundwaterChemistryDatabaseSQLTable, list(fields.keys())) as searchCursor:
-        for row in searchCursor:
-            insertCursor.insertRow(row)
+# -------------------------------------------------------------------------------------
+# Thresholds used for the WEEKLY EXCEEDANCE ALERT EMAIL (a separate, independent system
+# from the public-map exceedance thresholds further down - they cover different analytes
+# and serve a different purpose: a fast "something looks bad, go look at it" email).
+# -------------------------------------------------------------------------------------
 
-groundwaterChemistryDatabaseGISTableCleanedInMemory = "memory/GroundwaterChemistry_GWCDrawdataCleaned"
-arcpy.TableToTable_conversion(groundwaterChemistryDatabaseGISTable, "memory", "GroundwaterChemistry_GWCDrawdataCleaned")
+WEEKLY_ALERT_METALS_THRESHOLDS_MG_L = {
+    "Barium": 5,
+    "Cadmium": 0.005,
+    "Chromium": 0.1,
+    "Mercury": 0.002,
+    "Selenium": 0.05,
+    "Silver": 0.1,
+    "Antimony": 0.006,
+    "Beryllium": 0.004,
+    "Nickel": 0.021,
+    "Thallium": 0.002,
+    "Zinc": 5,
+}
 
-def AnalyteThresholdDetection(groundwaterChemistryDatabaseGISTableCleanedInMemory, EMAIL_SENDER, EMAIL_RECIPIENTS):
+# -------------------------------------------------------------------------------------
+# Thresholds used for the PUBLIC MAP exceedance calculations (per analyte):
+#   mcl       = Maximum Contaminant Level (federal/state enforceable limit)
+#   smcl      = Secondary MCL (aesthetic/nuisance limit, not health based)
+#   vha       = Vermont Health Advisory level
+#   threshold = Vermont's own "pay attention" level, usually lower than the MCL
+# A value of None means that limit doesn't apply to that analyte.
+# pH's "smcl" and Hardness's "threshold" are a (low, high) acceptable range instead of a
+# single cutoff - those two are handled as a special case in calculate_result_and_exceedances().
+# -------------------------------------------------------------------------------------
+
+EXCEEDANCE_THRESHOLDS_BY_ANALYTE = {
+    "Arsenic":                  {"mcl": 0.010, "smcl": None,       "vha": None,  "threshold": 0.001},
+    "Fluoride":                 {"mcl": 4.000, "smcl": 2.000,      "vha": None,  "threshold": 0.700},
+    "Gross Alpha":              {"mcl": 15,    "smcl": None,       "vha": None,  "threshold": 5},
+    "Nitrate":                  {"mcl": 10,    "smcl": None,       "vha": 5,     "threshold": 0},
+    "Nitrite":                  {"mcl": 1,     "smcl": None,       "vha": None,  "threshold": 0},
+    "Total Nitrate and Nitrite": {"mcl": 10,   "smcl": None,       "vha": None,  "threshold": 5},
+    "Sodium":                   {"mcl": None,  "smcl": 250,        "vha": None,  "threshold": 15},
+    "Chloride":                 {"mcl": None,  "smcl": 250,        "vha": None,  "threshold": 50},
+    "Manganese":                {"mcl": None,  "smcl": 0.05,       "vha": 0.3,   "threshold": 0.08},
+    "Lead":                     {"mcl": 0.015, "smcl": None,       "vha": 0.001, "threshold": None},
+    "Iron":                     {"mcl": None,  "smcl": 0.3,        "vha": None,  "threshold": None},
+    "Copper":                   {"mcl": 1.3,   "smcl": 1,          "vha": 1.3,   "threshold": None},
+    "Radon":                    {"mcl": None,  "smcl": None,       "vha": 4000,  "threshold": None},
+    "Uranium":                  {"mcl": 0.03,  "smcl": None,       "vha": 0.02,  "threshold": None},
+    "Radium":                   {"mcl": 5,     "smcl": None,       "vha": None,  "threshold": None},
+    "TDS":                      {"mcl": None,  "smcl": 500,        "vha": None,  "threshold": None},
+    "Turbidity":                {"mcl": None,  "smcl": None,       "vha": None,  "threshold": 1},
+    "Odor":                     {"mcl": None,  "smcl": 3,          "vha": None,  "threshold": None},
+    "E.coli":                   {"mcl": 0,     "smcl": None,       "vha": None,  "threshold": 0},
+    "Total Coliform":           {"mcl": None,  "smcl": None,       "vha": None,  "threshold": 0},
+    "pH":                       {"mcl": None,  "smcl": (6.5, 8.5), "vha": None,  "threshold": None},
+    "Hardness":                 {"mcl": None,  "smcl": None,       "vha": None,  "threshold": (75, 151)},
+}
+
+# Analytes that get their own tab/map on the public "Private Drinking Water Quality" app,
+# plus the plain-language threshold label and non-detect display settings for each one's
+# map popup. "exceedance_type" says which of the CityAbove.../PctAbove... fields on the
+# published table actually represents "above the limit" for that analyte.
+PUBLIC_MAP_ANALYTE_SETTINGS = {
+    "Arsenic":     {"exceedance_type": "MCL",       "threshold_label": "MCL (0.010 mg/L)",   "non_detect_display_threshold": 0.001, "units": "mg/L"},
+    "Fluoride":    {"exceedance_type": "Threshold",  "threshold_label": "PHS (0.7 mg/L)",     "non_detect_display_threshold": 0.3,   "units": "mg/L"},
+    "Gross Alpha": {"exceedance_type": "MCL",       "threshold_label": "MCL (15 pCi/L)",     "non_detect_display_threshold": 1.50,  "units": "pCi/L"},
+    "Nitrate":     {"exceedance_type": "MCL",       "threshold_label": "MRL (10 mg/L)",      "non_detect_display_threshold": 0.5,   "units": "mg/L"},
+    "Radon":       {"exceedance_type": "VHA",       "threshold_label": "VHA (4,000 pCi/L)",  "non_detect_display_threshold": 100,   "units": "pCi/L"},
+    "Uranium":     {"exceedance_type": "VHA",       "threshold_label": "VMCL (0.020 mg/L)",  "non_detect_display_threshold": 0.001, "units": "mg/L"},
+}
+
+# Standardizes messy free-text "water source" values down to a short, consistent set.
+WATER_SOURCE_STANDARDIZATION = {
+    "drilled well": "Drilled Well",
+    "dug well": "Dug Well",
+    "other": "Unknown",
+    "not reported by client": "Unknown",
+    "well": "Well",
+    "spring": "Spring",
+    "unknown": "Unknown",
+}
+
+# Standardizes messy free-text "analyte name" values down to a short, consistent set used
+# everywhere downstream (public map tabs, exceedance thresholds, popups, etc). Anything not
+# in this dictionary is left with AnalyteAlias blank and gets filtered out before publish.
+ANALYTE_NAME_STANDARDIZATION = {
+    "arsenic": "Arsenic", "arsenic total": "Arsenic",
+    "sulfate": "Sulfate",
+    "fluoride": "Fluoride",
+    "total dissolved": "TDS", "tds": "TDS",
+    "gross alpha": "Gross Alpha",
+    "total nitrate/nitrite": "Total Nitrate and Nitrite",
+    "nitrate & nitrite": "Total Nitrate and Nitrite",
+    "nitrate and nitrite as no3": "Total Nitrate and Nitrite",
+    "total nitrate and nitrite as n": "Total Nitrate and Nitrite",
+    "nitrate": "Nitrate", "nitrate as n": "Nitrate",
+    "nitrite": "Nitrite", "nitrite as n": "Nitrite",
+    "sodium": "Sodium",
+    "chloride": "Chloride",
+    "manganese": "Manganese",
+    "lead": "Lead",
+    "iron": "Iron",
+    "copper": "Copper",
+    "radon": "Radon", "radon-222": "Radon", "radon in water": "Radon",
+    "uranium": "Uranium", "uranium total": "Uranium",
+    "radium": "Radium", "radium-226": "Radium", "radium-228": "Radium", "radium-226/228": "Radium",
+    "e. coli": "E.coli", "e.coli": "E.coli", "escherichia": "E.coli",
+    "coliform": "Total Coliform", "coliforms": "Total Coliform",
+    "turbidity": "Turbidity",
+    "hardness": "Hardness",
+    "odor": "Odor",
+    "ph": "pH",
+}
+
+# Maps each SQL Server source column name to its (sometimes truncated) destination field
+# name in the SDE raw-data table. Most names match exactly; a handful of the
+# "SampleLocationPhysicalAddress..." fields are truncated to fit a 32-character field-name
+# limit on the destination side.
+SQL_TO_SDE_FIELD_MAP = {
+    'AdditionalEmail': 'AdditionalEmail', 'AnalysisType': 'AnalysisType',
+    'AnalyteName': 'AnalyteName', 'AnalyzedAmount': 'AnalyzedAmount',
+    'AnalyzedAmountUnit': 'AnalyzedAmountUnit', 'AnalyzedDateTime': 'AnalyzedDateTime',
+    'CAS_RegistryNumber': 'CAS_RegistryNumber', 'Chlorinated': 'Chlorinated',
+    'ClientEmail': 'ClientEmail', 'ClientMailingAddressCity': 'ClientMailingAddressCity',
+    'ClientMailingAddressLine1': 'ClientMailingAddressLine1', 'ClientMailingAddressLine2': 'ClientMailingAddressLine2',
+    'ClientMailingAddressState': 'ClientMailingAddressState', 'ClientMailingAddressZip': 'ClientMailingAddressZip',
+    'ClientName': 'ClientName', 'ClientNotes': 'ClientNotes',
+    'ClientPhoneNumber': 'ClientPhoneNumber', 'Composite': 'Composite',
+    'DilutionFactor': 'DilutionFactor', 'FileName': 'FileName',
+    'FilePosition': 'FilePosition', 'InsertDate': 'InsertDate',
+    'InsertUser': 'InsertUser', 'LabCertificationExpirationDate': 'LabCertificationExpirationDate',
+    'LabContact': 'LabContact', 'LabContactEmail': 'LabContactEmail',
+    'LabMailingAddressCity': 'LabMailingAddressCity', 'LabMailingAddressLine1': 'LabMailingAddressLine1',
+    'LabMailingAddressLine2': 'LabMailingAddressLine2', 'LabMailingAddressState': 'LabMailingAddressState',
+    'LabMailingAddressZip': 'LabMailingAddressZip', 'LabName': 'LabName',
+    'LabQualifiersDefinition': 'LabQualifiersDefinition', 'LastUpdateDate': 'LastUpdateDate',
+    'LastUpdateUser': 'LastUpdateUser', 'PostTreatmentSample': 'PostTreatmentSample',
+    'Preservative': 'Preservative', 'QualifiersAndNotes': 'QualifiersAndNotes',
+    'ReceivedDateTime': 'ReceivedDateTime', 'Record_uid': 'Record_uid',
+    'RejectionReason': 'RejectionReason', 'ReportType': 'ReportType',
+    'ReportedDateTime': 'ReportedDateTime', 'ReportingLimit': 'ReportingLimit',
+    'ReportingLimitType': 'ReportingLimitType', 'ReportingLimitUnit': 'ReportingLimitUnit',
+    'Result': 'Result', 'ResultType': 'ResultType', 'ResultUncertainty': 'ResultUncertainty',
+    'ResultUnit': 'ResultUnit', 'SPAN': 'SPAN', 'SampleAmount': 'SampleAmount',
+    'SampleAmountUnit': 'SampleAmountUnit', 'SampleCollectionDateTime': 'SampleCollectionDateTime',
+    'SampleCollector': 'SampleCollector', 'SampleFinishTime': 'SampleFinishTime',
+    'SampleFinishVolume': 'SampleFinishVolume', 'SampleFinishVolumeUnit': 'SampleFinishVolumeUnit',
+    'SampleLatitude': 'SampleLatitude', 'SampleLatitudeLongitudeFormat': 'SampleLatitudeLongitudeFormat',
+    'SampleLocationPhysicalAddressCity': 'SampleLocationPhysicalAddressCi',
+    'SampleLocationPhysicalAddressLine1': 'SampleLocationPhysicalAddress1',
+    'SampleLocationPhysicalAddressLine2': 'SampleLocationPhysicalAddress2',
+    'SampleLocationPhysicalAddressState': 'SampleLocationPhysicalAddressSt',
+    'SampleLocationPhysicalAddressZip': 'SampleLocationPhysicalAddressZi',
+    'SampleLongitude': 'SampleLongitude', 'SampleStartTime': 'SampleStartTime',
+    'SampleStartVolume': 'SampleStartVolume', 'SampleStartVolumeUnit': 'SampleStartVolumeUnit',
+    'SampleTemperature': 'SampleTemperature', 'SampleTemperatureUnit': 'SampleTemperatureUnit',
+    'SampleVolume': 'SampleVolume', 'SampleVolumeUnit': 'SampleVolumeUnit',
+    'SampleWeight': 'SampleWeight', 'SampleWeightUnit': 'SampleWeightUnit',
+    'SamplingLocationDescription': 'SamplingLocationDescription',
+    'SubcontractedResults': 'SubcontractedResults', 'TestMethodCode': 'TestMethodCode',
+    'TestMethodName': 'TestMethodName', 'Test_id': 'Test_id',
+    'VT_StateLab_id': 'VT_StateLab_id', 'VT_WellTag_id': 'VT_WellTag_id',
+    'WHCombinedResult': 'WHCombinedResult', 'WHResultType': 'WHResultType',
+    'WHResultUncertainty': 'WHResultUncertainty', 'WHResultValueAlpha': 'WHResultValueAlpha',
+    'WHResultValueNumeric': 'WHResultValueNumeric', 'WaterSource': 'WaterSource', 'pH': 'pH',
+}
+
+# Fields kept on the final, flattened external/public summary table (everything else is
+# dropped before publish).
+EXTERNAL_PUBLIC_TABLE_FIELDS = (
+    "AnalyteAlias;TOWNNAME;TOWNNAMEMC;CityCount;CityAboveMCL;CityAboveSMCL;CityAboveVHA;"
+    "CityAboveThreshold;PctAboveMCL;PctAboveSMCL;PctAboveVHA;PctAboveThreshold;Mean;Median;"
+    "Min_;Max_;Percentile95;StdDev"
+)
+
+# -------------------------------------------------------------------------------------
+# These four lists are the actual "what gets excluded from publish" business rules,
+# shared by build_published_record_filter_clause() below (which turns them into a SQL
+# where-clause). Keeping them as one shared set of Python values, instead of writing the
+# rule twice (once in SQL, once elsewhere), means the two can never drift apart.
+# -------------------------------------------------------------------------------------
+REJECTED_RESULT_TEXT_VALUES = (
+    "rejected", "na", "n/a", "rejection", "no data", "nd", "not tested",
+    "nda", "error", "error in result", "see attached", "",
+)
+EXCLUDED_WATER_SOURCE_VALUES = ("public", "surface", "lake/pond", "river", "stream", "municipal")
+EXCLUDED_CLIENT_NAME_VALUES = (
+    "learning", "school", "elem", "elementary", "daycare", "childcare",
+    "district", "childhood", "uvmmc", "vt agriculture environmental lab",
+    "early ed", "uvm-", "uvm", "city market", "vt agency of agriculture",
+    "vdh quarterly", "vdh lab", "vdh laboratory", "vdh bottle", "uhs",
+    "child care", "environmental health", "childrens", "academy",
+)
+EXCLUDED_SAMPLING_LOCATION_DESCRIPTION_VALUES = (
+    "learning", "school", "elem", "elementary", "daycare", "childcare",
+    "district", "childhood", "uvmmc", "early ed", "uvm-", "vdh laboratory",
+)
+
+# Marker prefix written into the (reused, not-a-real-schema-change) ConcatAddress field
+# for records that could not be geocoded at all, so they stay visible in the internal
+# points table instead of being silently dropped. Matches the existing convention of
+# using ConcatAddress to carry "<town> Centroid" and "DELETE" markers.
+GEOCODE_EXCLUSION_MARKER_PREFIX = "EXCLUDED - "
+GEOCODE_EXCLUSION_OUT_OF_STATE_MARKER = f"{GEOCODE_EXCLUSION_MARKER_PREFIX}Out of State Address, Not Geocoded"
+GEOCODE_EXCLUSION_NOT_GEOCODED_MARKER = f"{GEOCODE_EXCLUSION_MARKER_PREFIX}Address Could Not Be Geocoded"
+
+EXCLUDED_RECORDS_REPORT_ITEM_TITLE = "GroundwaterChemistry_ExcludedRecords"
+
+
+# =====================================================================================
+# CREDENTIALS
+# =====================================================================================
+
+def read_comma_separated_credentials_file(file_path):
     """
-    GLOBAL FILTERS
-    Location Filter: (UPPER(SampleLocationPhysicalAddressSt) IN ('VT','VERMONT','VTG','VT 0','VR','VRT','WATERV','0','q',
-                      'EEEEEEEEEEEEE','VTP','VTT','VST','V','VTD','```','VGT','VERM','AAAAAAAAAAAAA')
-                      OR SampleLocationPhysicalAddressSt = '' OR SampleLocationPhysicalAddressSt IS NULL)
-        Selects records where the physical address state is Vermont, a known typo/placeholder variant of "VT"
-        seen in the source data (e.g. 'VTG', 'q', '```', 'AAAAAAAAAAAAA'), blank, or NULL. The typo list was
-        built up over time from real bad data so those records aren't silently dropped.
-    Data Quality Filter: (Result IS NULL OR (LOWER(Result) NOT LIKE '%not tested%' AND LOWER(Result) NOT LIKE '%error in result%'
-                          AND LOWER(Result) NOT LIKE '%rejected%' AND LOWER(Result) NOT LIKE '%rejection%'
-                          AND LOWER(Result) NOT LIKE '%error%' AND LOWER(Result) NOT LIKE '%fail%' AND LOWER(Result) NOT LIKE '%complete%'))
-        Case-insensitive and NULL-safe: a NULL Result passes through (excluded later by the numeric CAST in the
-        contaminant filters below), and text results are excluded if they indicate the sample wasn't validly tested.
-    Client Exclusion Filter: (ClientName IS NULL OR LOWER(ClientName) NOT LIKE '%vdh lab proficiency%')
-        Case-insensitive and NULL-safe exclusion of VDH Lab Proficiency test records.
-    Date Filter: SampleCollectionDateTime >= timestamp 'YYYY-MM-DD HH:MI:SS'
-        - timedelta(days=7)
-        This is a dynamic filter that restricts the data to the last 7 days from the date the script is run. It ensures that only relatively recent data is analyzed.
-
-    CONTAMINANT-SPECIFIC FILTERS
-    Metals Filters: ResultUnit must be in milligrams per liter ('mg/L'), ResultType must be '=', and Result must be
-    greater than or equal to a specific threshold:
-        Barium: >= 5 mg/L
-        Cadmium: >= 0.005 mg/L
-        Chromium: >= 0.1 mg/L
-        Mercury: >= 0.002 mg/L
-        Selenium: >= 0.05 mg/L
-        Silver: >= 0.1 mg/L
-        Antimony: >= 0.006 mg/L
-        Beryllium: >= 0.004 mg/L
-        Nickel: >= 0.021 mg/L
-        Thallium: >= 0.002 mg/L
-        Zinc: >= 5 mg/L
-    VOCs Filter: (TestMethodCode LIKE '%524%' OR TestMethodName LIKE '%524%' OR TestMethodCode LIKE '%551%' OR TestMethodName LIKE '%551%')
-        AND (ResultUnit IS NULL OR ResultUnit NOT LIKE '%!%%' ESCAPE '!') AND ResultType = '='
-        Targets Volatile Organic Compounds (VOCs) analyzed using method code or name containing '524' or '551',
-        excluding records whose ResultUnit literally contains a '%' character (escaped so it isn't a wildcard),
-        while still allowing a NULL/blank unit through.
-    BNAs Filter: (TestMethodCode LIKE '%525%' OR TestMethodName LIKE '%525%')
-        AND (ResultUnit IS NULL OR ResultUnit NOT LIKE '%!%%' ESCAPE '!') AND ResultType = '='
-        Targets Base/Neutral Acids (BNAs) analyzed using method code or name containing '525'.
-    PCBs Filter: (TestMethodCode LIKE '%505%' OR TestMethodCode LIKE '%508%' OR TestMethodName LIKE '%505%' OR TestMethodName LIKE '%508%')
-        AND (ResultUnit IS NULL OR ResultUnit NOT LIKE '%!%%' ESCAPE '!') AND ResultType = '='
-        Targets Polychlorinated Biphenyls (PCBs) analyzed using method codes or names containing '505' or '508'.
-    Herbicides Filter: (TestMethodCode LIKE '%515%' OR TestMethodCode LIKE '%552%' OR TestMethodName LIKE '%515%' OR TestMethodName LIKE '%552%')
-        AND (ResultUnit IS NULL OR ResultUnit NOT LIKE '%!%%' ESCAPE '!') AND ResultType = '='
-        Targets herbicides analyzed using method codes or names containing '515' or '552'. (No AnalyteName
-        exclusions are currently applied.)
-    PFOS/PFAS Filter: (TestMethodCode LIKE '%533%' OR TestMethodCode LIKE '%537%' OR TestMethodName LIKE '%533%' OR TestMethodName LIKE '%537%')
-        AND (ResultUnit IS NULL OR ResultUnit NOT LIKE '%!%%' ESCAPE '!') AND ResultType = '='
-        AND (SamplingLocationDescription IS NULL OR UPPER(SamplingLocationDescription) NOT LIKE '%BLANK%')
-        Targets Perfluorooctanesulfonic acid (PFOS) and Per- and polyfluoroalkyl substances (PFAS) analyzed using
-        method codes or names containing '533' or '537', excluding blank samples (case-insensitive).
+    Reads a small text file containing comma-separated credential values (for example
+    "username,password" or "client_id,client_secret,tenant_id") and returns them as a
+    list of strings. This is the same simple format already used for the AGO credentials
+    file, and is now also used for the Azure AD credentials file below. It is a stopgap -
+    the plan is to move these into KeePass later instead of a plain text file.
     """
+    with open(file_path, "r") as creds_file:
+        return creds_file.read().strip().split(",")
 
-    # =============================================================================
-    # CONFIGURATION
-    # =============================================================================
 
-    # --- ArcGIS Data Configuration ---
-    groundwater_table = groundwaterChemistryDatabaseGISTableCleanedInMemory
+# =====================================================================================
+# STEP 1 - Mirror raw lab results from SQL Server into the SDE raw-data table.
+# =====================================================================================
 
-    def emailNotification(body, email_sender, email_recipients, csv_string=None, attachment_filename=None):
-        """
-        Sends a multipart email with an HTML body and an optional CSV attachment.
-        """
-        try:
-            # Create the container email message.
-            msg = MIMEMultipart()
-            msg['Subject'] = '|| Automated Alert || - Weekly Groundwater Chemistry Analyte Exceedance Report'
-            msg['From'] = email_sender
-            msg['To'] = ", ".join(email_recipients)
+def refresh_raw_data_table(sql_source_table, raw_data_table, field_map):
+    """
+    Copies every row from the SQL Server chemistry results table into the SDE raw-data
+    table, mapping each source column to its (sometimes truncated) destination field name.
+    The destination table is fully cleared first and then reloaded from scratch, so this
+    is a complete refresh rather than an incremental update. There is a brief window where
+    the raw-data table is empty while this runs; that's an accepted tradeoff since the job
+    only runs overnight.
 
-            # 1. Attach the HTML body part.
-            html_part = MIMEText(body, 'html')
-            msg.attach(html_part)
+    This deliberately uses a plain row-by-row cursor loop rather than a bulk Append/
+    FieldMappings copy, even though that's slower at this table's size (roughly three
+    quarters of a million rows). Record_uid - the field this table is keyed on - has no
+    registered primary key on the SQL Server side, so arcpy auto-promotes it to serve as
+    that view's surrogate Object ID. Any tool that assigns/recognizes an OID (TableToTable,
+    Append with a field mapping) consumes Record_uid for that role instead of copying it as
+    an ordinary attribute, silently producing blank or collapsed values. A plain SearchCursor/
+    InsertCursor asks for it by name with no OID reinterpretation, which is the only
+    approach confirmed to copy it correctly - this was found and verified the hard way
+    while testing a bulk-Append version of this function.
+    """
+    arcpy.management.DeleteRows(raw_data_table)
 
-            # 2. If a CSV string is provided, attach it as a file.
-            if csv_string and attachment_filename:
-                csv_part = MIMEApplication(csv_string.encode('utf-8'), Name=attachment_filename)
-                csv_part['Content-Disposition'] = f'attachment; filename="{attachment_filename}"'
-                msg.attach(csv_part)
+    source_field_names = list(field_map.keys())
+    destination_field_names = list(field_map.values())
 
-            # 3. Send the complete message.
-            server = smtplib.SMTP('relay.state.vt.us')
-            server.sendmail(email_sender, email_recipients, msg.as_string())
-            
-            if attachment_filename:
-                print(f"Summary email with CSV attachment '{attachment_filename}' sent successfully.")
-            else:
-                print("Email sent successfully.")
-            
-        except Exception as e:
-            print(f"Failed to send email: {e}")
+    with arcpy.da.InsertCursor(raw_data_table, destination_field_names) as insert_cursor:
+        with arcpy.da.SearchCursor(sql_source_table, source_field_names) as search_cursor:
+            for row in search_cursor:
+                insert_cursor.insertRow(row)
 
-    def check_groundwater_data():
-        """
-        Filters data, classifies/sorts results, and sends a summary email
-        with a CSV attachment.
-        """
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=7)
-        #start_date = end_date - timedelta(days=30)
-        start_date_sql_str = start_date.strftime('%Y-%m-%d %H:%M:%S')
-        date_filter = f"SampleCollectionDateTime >= timestamp '{start_date_sql_str}'"
 
-        #all_data_filters = [
-        #    "(UPPER(SampleLocationPhysicalAddressSt) = 'VT' OR SampleLocationPhysicalAddressSt = '' OR SampleLocationPhysicalAddressSt IS NULL)",
-        #    "(LOWER(Result) NOT LIKE '%not tested%' AND LOWER(Result) NOT LIKE '%error in result%' AND LOWER(Result) NOT LIKE '%rejected%' AND LOWER(Result) NOT LIKE '%rejection%' AND LOWER(Result) NOT LIKE '%error%' AND LOWER(Result) NOT LIKE '%fail%' AND LOWER(Result) NOT LIKE '%complete%')",
-        #    "LOWER(ClientName) NOT LIKE '%vdh lab proficiency%'",
-        #    date_filter,
-        #]
+# =====================================================================================
+# STEP 2 - Weekly exceedance alert email.
+# This looks back 7 days for lab results that cross a safety threshold and emails a
+# summary report. It is a separate, independent check from the public-map exceedance
+# calculations further down - it runs against the raw data, before any geocoding, town
+# matching, or name standardization happens.
+# =====================================================================================
 
-        all_data_filters = [
-            #"(UPPER(SampleLocationPhysicalAddressSt) = 'VT' OR SampleLocationPhysicalAddressSt = '' OR SampleLocationPhysicalAddressSt IS NULL)",
-            "(UPPER(SampleLocationPhysicalAddressSt) IN ('VT','VERMONT','VTG','VT 0','VR','VRT','WATERV','0','q','EEEEEEEEEEEEE','VTP','VTT','VST','V','VTD','```','VGT','VERM','AAAAAAAAAAAAA') OR SampleLocationPhysicalAddressSt = '' OR SampleLocationPhysicalAddressSt IS NULL)",
-
-            "("
-            "Result IS NULL OR "
-            "("
-            "LOWER(Result) NOT LIKE '%not tested%' "
-            "AND LOWER(Result) NOT LIKE '%error in result%' "
-            "AND LOWER(Result) NOT LIKE '%rejected%' "
-            "AND LOWER(Result) NOT LIKE '%rejection%' "
-            "AND LOWER(Result) NOT LIKE '%error%' "
-            "AND LOWER(Result) NOT LIKE '%fail%' "
-            "AND LOWER(Result) NOT LIKE '%complete%'"
-            ")"
-            ")",
-
-            "(ClientName IS NULL OR LOWER(ClientName) NOT LIKE '%vdh lab proficiency%')",
-
-            date_filter,
-        ]
-
-        metals_filters = [
-            "(AnalyteName LIKE '%Barium%' AND ResultUnit = 'mg/L' AND CAST(Result AS FLOAT) >= 5 AND ResultType = '=')",
-            "(AnalyteName LIKE '%Cadmium%' AND ResultUnit = 'mg/L' AND CAST(Result AS FLOAT) >= 0.005 AND ResultType = '=')",
-            "(AnalyteName LIKE '%Chromium%' AND ResultUnit = 'mg/L' AND CAST(Result AS FLOAT) >= 0.1 AND ResultType = '=')",
-            "(AnalyteName LIKE '%Mercury%' AND ResultUnit = 'mg/L' AND CAST(Result AS FLOAT) >= 0.002 AND ResultType = '=')",
-            "(AnalyteName LIKE '%Selenium%' AND ResultUnit = 'mg/L' AND CAST(Result AS FLOAT) >= 0.05 AND ResultType = '=')",
-            "(AnalyteName LIKE '%Silver%' AND ResultUnit = 'mg/L' AND CAST(Result AS FLOAT) >= 0.1 AND ResultType = '=')",
-            "(AnalyteName LIKE '%Antimony%' AND ResultUnit = 'mg/L' AND CAST(Result AS FLOAT) >= 0.006 AND ResultType = '=')",
-            "(AnalyteName LIKE '%Beryllium%' AND ResultUnit = 'mg/L' AND CAST(Result AS FLOAT) >= 0.004 AND ResultType = '=')",
-            "(AnalyteName LIKE '%Nickel%' AND ResultUnit = 'mg/L' AND CAST(Result AS FLOAT) >= 0.021 AND ResultType = '=')",
-            "(AnalyteName LIKE '%Thallium%' AND ResultUnit = 'mg/L' AND CAST(Result AS FLOAT) >= 0.002 AND ResultType = '=')",
-            "(AnalyteName LIKE '%Zinc%' AND ResultUnit = 'mg/L' AND CAST(Result AS FLOAT) >= 5 AND ResultType = '=')"
-        ]
-
-        #vocs_filter = "((TestMethodCode LIKE '%524%' OR TestMethodName LIKE '%524%' OR TestMethodCode LIKE '%551%' OR TestMethodName LIKE '%551%') AND ResultUnit NOT LIKE '%!%%' ESCAPE '!' AND ResultType = '=')"
-        vocs_filter = (
-            "((TestMethodCode LIKE '%524%' "
-            "OR TestMethodName LIKE '%524%' "
-            "OR TestMethodCode LIKE '%551%' "
-            "OR TestMethodName LIKE '%551%') "
-            "AND "
-            "(ResultUnit IS NULL OR ResultUnit NOT LIKE '%!%%' ESCAPE '!') "
-            "AND ResultType = '=')"
+def build_metals_exceedance_filter(metals_thresholds_mg_l):
+    """
+    Builds the SQL fragment that matches any metals result at or above its safety
+    threshold, given a dictionary of {analyte name: threshold in mg/L}. Every metal uses
+    the same comparison shape (unit must be mg/L, result type must be an exact "=", and
+    the result must be at or above the threshold), so this builds all of them from one
+    small loop instead of repeating the same fragment by hand for each metal.
+    """
+    metal_filter_fragments = []
+    for analyte_name, threshold_mg_l in metals_thresholds_mg_l.items():
+        fragment = (
+            f"(AnalyteName LIKE '%{analyte_name}%' AND ResultUnit = 'mg/L' "
+            f"AND CAST(Result AS FLOAT) >= {threshold_mg_l} AND ResultType = '=')"
         )
-        #bnas_filter = "((TestMethodCode LIKE '%525%' OR TestMethodName LIKE '%525%') AND NOT ResultUnit LIKE '%%' AND ResultUnit NOT LIKE '%!%%' ESCAPE '!' AND ResultType = '=')"
-        bnas_filter = (
-            "((TestMethodCode LIKE '%525%' "
-            "OR TestMethodName LIKE '%525%') "
-            "AND "
-            "(ResultUnit IS NULL OR ResultUnit NOT LIKE '%!%%' ESCAPE '!') "
-            "AND ResultType = '=')"
-        )
-        #pcbs_filter = "((TestMethodCode LIKE '%505%' OR TestMethodCode LIKE '%508%' OR TestMethodName LIKE '%505%' OR TestMethodName LIKE '%508%') AND ResultUnit NOT LIKE '%!%%' ESCAPE '!' AND ResultType = '=')"
-        pcbs_filter = (
-            "((TestMethodCode LIKE '%505%' "
-            "OR TestMethodCode LIKE '%508%' "
-            "OR TestMethodName LIKE '%505%' "
-            "OR TestMethodName LIKE '%508%') "
-            "AND "
-            "(ResultUnit IS NULL OR ResultUnit NOT LIKE '%!%%' ESCAPE '!') "
-            "AND ResultType = '=')"
-        )
-        #herbicides_filter = "((TestMethodCode LIKE '%515%' OR TestMethodCode LIKE '%552%' OR TestMethodName LIKE '%515%' OR TestMethodName LIKE '%552%') AND ResultUnit NOT LIKE '%!%%' ESCAPE '!' AND ResultType = '=')"
-        herbicides_filter = (
-            "((TestMethodCode LIKE '%515%' "
-            "OR TestMethodCode LIKE '%552%' "
-            "OR TestMethodName LIKE '%515%' "
-            "OR TestMethodName LIKE '%552%') "
-            "AND "
-            "(ResultUnit IS NULL OR ResultUnit NOT LIKE '%!%%' ESCAPE '!') "
-            "AND ResultType = '=')"
-        )
-        #pfos_pfas_filter = "((TestMethodCode LIKE '%533%' OR TestMethodCode LIKE '%537%' OR TestMethodName LIKE '%533%' OR TestMethodName LIKE '%537%') AND ResultUnit NOT LIKE '%!%%' ESCAPE '!' AND ResultType = '=' AND NOT Upper(SamplingLocationDescription) LIKE '%BLANK%')"
-        pfos_pfas_filter = (
-            "((TestMethodCode LIKE '%533%' "
-            "OR TestMethodCode LIKE '%537%' "
-            "OR TestMethodName LIKE '%533%' "
-            "OR TestMethodName LIKE '%537%') "
-            "AND "
-            "(ResultUnit IS NULL OR ResultUnit NOT LIKE '%!%%' ESCAPE '!') "
-            "AND ResultType = '=' "
-            "AND "
-            "(SamplingLocationDescription IS NULL "
-            "OR UPPER(SamplingLocationDescription) NOT LIKE '%BLANK%'))"
-        )
+        metal_filter_fragments.append(fragment)
+    return metal_filter_fragments
 
-        contaminant_filters = f"({ ' OR '.join(metals_filters) } OR {vocs_filter} OR {bnas_filter} OR {pcbs_filter} OR {herbicides_filter} OR {pfos_pfas_filter})"
-        where_clause = f"({' AND '.join(all_data_filters)}) AND ({contaminant_filters})"
 
-        fields = ["AnalyteName", "Result", "ResultUnit", "SampleLocationPhysicalAddress1", "SampleLocationPhysicalAddressCi", "SampleCollectionDateTime",
-                "ClientName", "TestMethodCode", "TestMethodName", "ResultType", "Record_uid"]
+def build_weekly_alert_where_clause():
+    """
+    Builds the full SQL where-clause used by the weekly exceedance alert email. It combines
+    a handful of general data-quality filters (Vermont address only, no "rejected"/"error"
+    results, excludes VDH lab proficiency test records, last 7 days only) with a set of
+    contaminant-specific filters covering metals, VOCs, BNAs, PCBs, herbicides, and
+    PFOS/PFAS, each matched by test method code or name.
+    """
+    seven_days_ago = datetime.now() - timedelta(days=7)
+    seven_days_ago_sql = seven_days_ago.strftime("%Y-%m-%d %H:%M:%S")
 
-        alert_records = []
-        with arcpy.da.SearchCursor(groundwater_table, fields, where_clause) as cursor:
-            for row in cursor:
-                record_class = get_record_class(fields, row)
-                alert_records.append(list(row) + [record_class])
+    general_filters = [
+        "(UPPER(SampleLocationPhysicalAddressSt) IN ('VT','VERMONT','VTG','VT 0','VR','VRT',"
+        "'WATERV','0','q','EEEEEEEEEEEEE','VTP','VTT','VST','V','VTD','```','VGT','VERM',"
+        "'AAAAAAAAAAAAA') OR SampleLocationPhysicalAddressSt = '' OR SampleLocationPhysicalAddressSt IS NULL)",
 
-        if alert_records:
-            alert_records.sort(key=lambda record: record[5] if record[5] else datetime.min, reverse=True) # Index adjusted for new field
+        "(Result IS NULL OR (LOWER(Result) NOT LIKE '%not tested%' "
+        "AND LOWER(Result) NOT LIKE '%error in result%' AND LOWER(Result) NOT LIKE '%rejected%' "
+        "AND LOWER(Result) NOT LIKE '%rejection%' AND LOWER(Result) NOT LIKE '%error%' "
+        "AND LOWER(Result) NOT LIKE '%fail%' AND LOWER(Result) NOT LIKE '%complete%'))",
 
-            csv_header = ["Classification", "Analyte", "ResultType", "Result", "Unit", "Client", "Sample_Date",
-                        "Location", "City", "TestMethodName", "TestMethodCode", "Record_uid"]
+        "(ClientName IS NULL OR LOWER(ClientName) NOT LIKE '%vdh lab proficiency%')",
 
-            output = io.StringIO()
-            writer = csv.writer(output)
-            writer.writerow(csv_header)
+        f"SampleCollectionDateTime >= timestamp '{seven_days_ago_sql}'",
+    ]
 
-            for record in alert_records:
-                csv_row = [
-                    record[11],  # Classification
-                    record[0],   # AnalyteName
-                    record[9],   # ResultType
-                    record[1],   # Result
-                    record[2],   # ResultUnit
-                    record[6],   # ClientName
-                    record[5].strftime('%Y-%m-%d') if record[5] else "", # SampleCollectionDateTime
-                    record[3],   # SampleLocationPhysicalAddress1
-                    record[4],   # SampleLocationPhysicalAddressCi
-                    record[8],   # TestMethodName
-                    record[7],   # TestMethodCode
-                    record[10]    # Record_uid
-                ]
-                writer.writerow(csv_row)
+    metals_filters = build_metals_exceedance_filter(WEEKLY_ALERT_METALS_THRESHOLDS_MG_L)
 
-            csv_content_string = output.getvalue()
-            output.close()
+    # VOCs, BNAs, PCBs, herbicides, and PFOS/PFAS are all identified the same way: by test
+    # method code or name containing a known method number, with a numeric (non-percent)
+    # result unit and an exact ("=") result type. PFOS/PFAS additionally excludes blanks.
+    vocs_filter = (
+        "((TestMethodCode LIKE '%524%' OR TestMethodName LIKE '%524%' "
+        "OR TestMethodCode LIKE '%551%' OR TestMethodName LIKE '%551%') "
+        "AND (ResultUnit IS NULL OR ResultUnit NOT LIKE '%!%%' ESCAPE '!') AND ResultType = '=')"
+    )
+    bnas_filter = (
+        "((TestMethodCode LIKE '%525%' OR TestMethodName LIKE '%525%') "
+        "AND (ResultUnit IS NULL OR ResultUnit NOT LIKE '%!%%' ESCAPE '!') AND ResultType = '=')"
+    )
+    pcbs_filter = (
+        "((TestMethodCode LIKE '%505%' OR TestMethodCode LIKE '%508%' "
+        "OR TestMethodName LIKE '%505%' OR TestMethodName LIKE '%508%') "
+        "AND (ResultUnit IS NULL OR ResultUnit NOT LIKE '%!%%' ESCAPE '!') AND ResultType = '=')"
+    )
+    herbicides_filter = (
+        "((TestMethodCode LIKE '%515%' OR TestMethodCode LIKE '%552%' "
+        "OR TestMethodName LIKE '%515%' OR TestMethodName LIKE '%552%') "
+        "AND (ResultUnit IS NULL OR ResultUnit NOT LIKE '%!%%' ESCAPE '!') AND ResultType = '=')"
+    )
+    pfas_filter = (
+        "((TestMethodCode LIKE '%533%' OR TestMethodCode LIKE '%537%' "
+        "OR TestMethodName LIKE '%533%' OR TestMethodName LIKE '%537%') "
+        "AND (ResultUnit IS NULL OR ResultUnit NOT LIKE '%!%%' ESCAPE '!') AND ResultType = '=' "
+        "AND (SamplingLocationDescription IS NULL OR UPPER(SamplingLocationDescription) NOT LIKE '%BLANK%'))"
+    )
 
-            html_table = "<table border='1' cellspacing='0' cellpadding='5'>\n"
-            html_table += (
-                "<tr>"
-                "<th>Classification</th><th>Analyte</th><th>ResultType</th><th>Result</th><th>Unit</th>"
-                "<th>Client</th><th>Sample Date</th><th>Location</th><th>City</th>"
-                "<th>TestMethodName</th><th>TestMethodCode</th><th>Record_uid</th>"
-                "</tr>\n"
-            )
-            def esc(value):
-                return html.escape(str(value)) if value else 'N/A'
+    contaminant_filters = (
+        f"({' OR '.join(metals_filters)} OR {vocs_filter} OR {bnas_filter} "
+        f"OR {pcbs_filter} OR {herbicides_filter} OR {pfas_filter})"
+    )
 
-            for record in alert_records:
-                # Note: All indices after the new field are shifted by 1
-                html_table += (
-                    f"<tr>"
-                    f"<td>{esc(record[11])}</td>" # Classification
-                    f"<td>{esc(record[0])}</td>"  # AnalyteName
-                    f"<td>{esc(record[9])}</td>"  # ResultType
-                    f"<td>{esc(record[1])}</td>"  # Result
-                    f"<td>{esc(record[2])}</td>"  # ResultUnit
-                    f"<td>{esc(record[6])}</td>"  # ClientName
-                    f"<td>{record[5].strftime('%Y-%m-%d') if record[5] else 'N/A'}</td>" # Date
-                    f"<td>{esc(record[3])}</td>"  # Location
-                    f"<td>{esc(record[4])}</td>"  # City
-                    f"<td>{esc(record[8])}</td>"  # TestMethodName
-                    f"<td>{esc(record[7])}</td>"  # TestMethodCode
-                    f"<td>{esc(record[10])}</td>"  # Record_uid
-                    f"</tr>\n"
-                )
-            html_table += "</table>\n"
+    return f"({' AND '.join(general_filters)}) AND ({contaminant_filters})"
 
-            body = f"""
-            <html><body>
-            <p>- Weekly Groundwater Chemistry Analyte Exceedance Report -</p>
-            <p>Hello,</p>
-            <p>Analyte exceedances found for <b>{len(alert_records)}</b> record(s) in the last 7 days ending on {datetime.now().strftime('%Y-%m-%d')}.</p>
-            <p>The attached CSV file contains a downloadable copy of this data.</p>
-            {html_table}
-            <p>Contact the AHS GIS & Data Viz team for questions: ADS.VCGIAHSTechs@vermont.gov.</p>
-            <p>Thank you.</p>
-            </body></html>
-            """
 
-            today_str = datetime.now().strftime('%Y-%m-%d')
-            attachment_filename = f"Groundwater_Exceedance_Report_{today_str}.csv"
+def classify_contaminant_group(analyte_name, test_method_code, test_method_name):
+    """
+    Figures out which broad contaminant group a lab result belongs to (Metals, PFOS/PFAS,
+    VOCs, BNAs, PCBs, Herbicides, or Other), based on the analyte name or the test method
+    code/name. Used to label rows in the weekly exceedance alert email.
+    """
+    test_method_code = test_method_code or ""
+    test_method_name = test_method_name or ""
 
-            emailNotification(body, EMAIL_SENDER, EMAIL_RECIPIENTS, csv_content_string, attachment_filename)
+    metal_analyte_names = list(WEEKLY_ALERT_METALS_THRESHOLDS_MG_L.keys())
+    if any(metal_name in analyte_name for metal_name in metal_analyte_names):
+        return "Metals"
 
+    if "533" in test_method_code or "537" in test_method_code or "533" in test_method_name or "537" in test_method_name:
+        return "PFOS/PFAS"
+    if "524" in test_method_code or "524" in test_method_name or "551" in test_method_code or "551" in test_method_name:
+        return "VOCs"
+    if "525" in test_method_code or "525" in test_method_name:
+        return "BNAs"
+    if "505" in test_method_code or "508" in test_method_code or "505" in test_method_name or "508" in test_method_name:
+        return "PCBs"
+    if "515" in test_method_code or "552" in test_method_code or "515" in test_method_name or "552" in test_method_name:
+        return "Herbicides"
+    return "Other"
+
+
+def send_email_notification(html_body, email_sender, email_recipients, csv_text=None, csv_attachment_filename=None):
+    """
+    Sends an HTML email, with an optional CSV file attached, through the department's SMTP
+    relay. Used for both the weekly exceedance alert ("here are N records that need a
+    look") and the "no exceedances this week" all-clear message.
+    """
+    try:
+        message = MIMEMultipart()
+        message["Subject"] = "|| Automated Alert || - Weekly Groundwater Chemistry Analyte Exceedance Report"
+        message["From"] = email_sender
+        message["To"] = ", ".join(email_recipients)
+        message.attach(MIMEText(html_body, "html"))
+
+        if csv_text and csv_attachment_filename:
+            csv_attachment = MIMEApplication(csv_text.encode("utf-8"), Name=csv_attachment_filename)
+            csv_attachment["Content-Disposition"] = f'attachment; filename="{csv_attachment_filename}"'
+            message.attach(csv_attachment)
+
+        smtp_server = smtplib.SMTP("relay.state.vt.us")
+        smtp_server.sendmail(email_sender, email_recipients, message.as_string())
+
+        if csv_attachment_filename:
+            print(f"Summary email with CSV attachment '{csv_attachment_filename}' sent successfully.")
         else:
-            print("No records found matching the alert criteria in the last 7 days.")
-            body = f"""
-            <html><body>
-            <p>- Weekly Groundwater Chemistry Analyte Exceedance Report -</p>
-            <p>Hello,</p>
-            <p>No analyte exceedances were found for the 7 day period ending on {datetime.now().strftime('%Y-%m-%d')}.</p>
-            <p>Contact the AHS GIS & Data Viz team for questions: ADS.VCGIAHSTechs@vermont.gov.</p>
-            <p>Thank you.</p>
-            </body></html>
-            """
-            emailNotification(body, EMAIL_SENDER, EMAIL_RECIPIENTS)
-            
-    def get_record_class(record_fields, record_row):
+            print("Email sent successfully.")
+    except Exception as error:
+        print(f"Failed to send email: {error}")
+
+
+def run_weekly_exceedance_alert(raw_data_memory_table, email_sender, email_recipients):
+    """
+    Looks back 7 days for lab results that cross a safety threshold (metals, VOCs, BNAs,
+    PCBs, herbicides, or PFOS/PFAS) and emails a summary. If nothing was found, sends a
+    short "all clear" email instead. This runs against the raw, not-yet-geocoded data, so
+    the only fields available are whatever came straight from the lab.
+    """
+    where_clause = build_weekly_alert_where_clause()
+
+    fields = [
+        "AnalyteName", "Result", "ResultUnit", "SampleLocationPhysicalAddress1",
+        "SampleLocationPhysicalAddressCi", "SampleCollectionDateTime", "ClientName",
+        "TestMethodCode", "TestMethodName", "ResultType", "Record_uid",
+    ]
+
+    alert_records = []
+    with arcpy.da.SearchCursor(raw_data_memory_table, fields, where_clause) as cursor:
+        for row in cursor:
+            analyte_name, result, result_unit, address, city, sample_date, client_name, \
+                test_method_code, test_method_name, result_type, record_uid = row
+            contaminant_group = classify_contaminant_group(analyte_name, test_method_code, test_method_name)
+            alert_records.append(list(row) + [contaminant_group])
+
+    if not alert_records:
+        print("No records found matching the alert criteria in the last 7 days.")
+        body = f"""
+        <html><body>
+        <p>- Weekly Groundwater Chemistry Analyte Exceedance Report -</p>
+        <p>Hello,</p>
+        <p>No analyte exceedances were found for the 7 day period ending on {datetime.now().strftime('%Y-%m-%d')}.</p>
+        <p>Contact the AHS GIS & Data Viz team for questions: ADS.VCGIAHSTechs@vermont.gov.</p>
+        <p>Thank you.</p>
+        </body></html>
         """
-        Classifies a record into a contaminant group based on its AnalyteName
-        and TestMethod.
-        """
-        row_dict = dict(zip(record_fields, record_row))
-        
-        analyte = row_dict.get("AnalyteName", "")
-        test_code = row_dict.get("TestMethodCode", "") or ""
-        test_name = row_dict.get("TestMethodName", "") or ""
+        send_email_notification(body, email_sender, email_recipients)
+        return
 
-        metal_analytes = [
-            'Barium', 'Cadmium', 'Chromium', 'Mercury', 'Selenium', 'Silver',
-            'Antimony', 'Beryllium', 'Nickel', 'Thallium', 'Zinc'
-        ]
-        if any(metal in analyte for metal in metal_analytes):
-            return "Metals"
-        
-        if '533' in test_code or '537' in test_code or '533' in test_name or '537' in test_name:
-            return "PFOS/PFAS"
-        if '524' in test_code or '524' in test_name or '551' in test_code or '551' in test_name:
-            return "VOCs"
-        if '525' in test_code or '525' in test_name:
-            return "BNAs"
-        if '505' in test_code or '508' in test_code or '505' in test_name or '508' in test_name:
-            return "PCBs"
-        if '515' in test_code or '552' in test_code or '515' in test_name or '552' in test_name:
-            return "Herbicides"
-            
-        return "Other"
+    # Sort newest sample first. SampleCollectionDateTime is index 5; contaminant group was
+    # appended as the last column.
+    alert_records.sort(key=lambda record: record[5] if record[5] else datetime.min, reverse=True)
 
-    check_groundwater_data()
+    csv_output = io.StringIO()
+    csv_writer = csv.writer(csv_output)
+    csv_writer.writerow([
+        "Classification", "Analyte", "ResultType", "Result", "Unit", "Client", "Sample_Date",
+        "Location", "City", "TestMethodName", "TestMethodCode", "Record_uid",
+    ])
 
-AnalyteThresholdDetection(groundwaterChemistryDatabaseGISTableCleanedInMemory, EMAIL_SENDER, EMAIL_RECIPIENTS)
+    def format_html_cell(value):
+        return html.escape(str(value)) if value else "N/A"
 
-def GetJoinedPoints(groundwaterChemistryDatabaseGISTableCleanedInMemory, groundwaterChemistryDatabaseGISAliasTable, townBounds):
-    """
-    Returns the joined points table from the groundwater chemistry database.
-    """
+    html_table_rows = ""
+    for record in alert_records:
+        analyte_name, result, result_unit, address, city, sample_date, client_name, \
+            test_method_code, test_method_name, result_type, record_uid, contaminant_group = record
+        sample_date_text = sample_date.strftime("%Y-%m-%d") if sample_date else ""
 
-    # Zip code fixes
-    # Fix zip dashes for zeros
-    clause = """SampleLocationPhysicalAddressZi LIKE '-%'"""
-    selection = arcpy.management.SelectLayerByAttribute(groundwaterChemistryDatabaseGISTableCleanedInMemory,"NEW_SELECTION",clause)
-    arcpy.management.CalculateField(selection, "SampleLocationPhysicalAddressZi", "!SampleLocationPhysicalAddressZi!.replace('-','0')")
-    # Fix zip one replacements
-    clause = """SampleLocationPhysicalAddressZi LIKE '1%'"""
-    selection = arcpy.management.SelectLayerByAttribute(groundwaterChemistryDatabaseGISTableCleanedInMemory,"NEW_SELECTION",clause)
-    arcpy.management.CalculateField(selection, "SampleLocationPhysicalAddressZi", "'0' + !SampleLocationPhysicalAddressZi![1:5]")
-    # Fix missing leading zeros
-    clause = """SampleLocationPhysicalAddressZi NOT LIKE '0%' AND SampleLocationPhysicalAddressZi NOT IN ('NA','VT','Not Report','Well')"""    
-    selection = arcpy.management.SelectLayerByAttribute(groundwaterChemistryDatabaseGISTableCleanedInMemory,"NEW_SELECTION",clause)
-    arcpy.management.CalculateField(selection, "SampleLocationPhysicalAddressZi", "'0' + !SampleLocationPhysicalAddressZi!")
+        csv_writer.writerow([
+            contaminant_group, analyte_name, result_type, result, result_unit, client_name,
+            sample_date_text, address, city, test_method_name, test_method_code, record_uid,
+        ])
 
-    # Update Sample Location values
-    sampleLocationsDictionary = {
-        'drilled well':'Drilled Well',
-        'dug well':'Dug Well',
-        'other':'Unknown',
-        'not reported by client':'Unknown',
-        'well':'Well',
-        'spring':'Spring',
-        'unknown':'Unknown'
-    }
+        html_table_rows += (
+            f"<tr><td>{format_html_cell(contaminant_group)}</td><td>{format_html_cell(analyte_name)}</td>"
+            f"<td>{format_html_cell(result_type)}</td><td>{format_html_cell(result)}</td>"
+            f"<td>{format_html_cell(result_unit)}</td><td>{format_html_cell(client_name)}</td>"
+            f"<td>{sample_date_text or 'N/A'}</td><td>{format_html_cell(address)}</td>"
+            f"<td>{format_html_cell(city)}</td><td>{format_html_cell(test_method_name)}</td>"
+            f"<td>{format_html_cell(test_method_code)}</td><td>{format_html_cell(record_uid)}</td></tr>\n"
+        )
 
-    # Update Water Source values and substitute unknown values where the description field has the needed value
-    with arcpy.da.UpdateCursor(groundwaterChemistryDatabaseGISTableCleanedInMemory, ["WaterSource","SamplingLocationDescription"]) as updateCursor:
-        for row in updateCursor:
-            waterSource = str(row[0]).lower().strip()
-            description = str(row[1]).lower().strip()
-            if waterSource in ['other','not reported by client','none']:
-                for source in ['drilled well','dug well','well','spring']:
-                    if source == description:
-                        row[0] = sampleLocationsDictionary[source]
-                    else:
-                        row[0] = "Unknown"
-            elif waterSource in sampleLocationsDictionary:
-                row[0] = sampleLocationsDictionary[waterSource]
-            else:
-                pass
-            updateCursor.updateRow(row)
+    html_table = (
+        "<table border='1' cellspacing='0' cellpadding='5'>\n"
+        "<tr><th>Classification</th><th>Analyte</th><th>ResultType</th><th>Result</th><th>Unit</th>"
+        "<th>Client</th><th>Sample Date</th><th>Location</th><th>City</th>"
+        "<th>TestMethodName</th><th>TestMethodCode</th><th>Record_uid</th></tr>\n"
+        f"{html_table_rows}</table>\n"
+    )
 
-    # Update town values (get alias values then update the values)
-    """
-    here are the out of state and problematic SampleLocationPhysicalAddressCi values.
-    This discounts the fact that they are all problematic, and that the alias table
-    is really just a series of exceptions. It would be better to validate the data 
-    during entry, and slowly update all these problematic values to be correct.
-
-    Barre	MultiField Required
-    Champlain	MultiField Required
-    Kitchen	MultiField Required
-    Orleans	MultiField Required
-
-    Qsue	Unknown
-    TC	Unknown
-    W	Westbrook, CT
-    Westbrook CT	Westbrook, CT
-    Westbrook	Westbrook, CT
-    Casco	Casco, ME
-    Boston	Boston, MA
-    Brooksville	likely Brooksville, ME
-    Ceadshore	maybe Readsboro
-    Checkerberry Village	Milton or Charlotte
-    Chestertown	Chestertown, NY
-    Claremont	Claremont, NH
-    Clemons	Clemons, NY
-    Columbia	Columbia, MD
-    Cornish	Cornish, NH
-    Dalton	Dalton, NH
-    Ellenburg Center	Ellenburg Center, NY
-    Enfield	Enfield, NH
-    Etna	Etna, NH
-    Exeter	Exeter, RI
-    Fort Edward	Fort Edward, NY
-    Gorham	Gorham, NH
-    Grantham	Grantham, NH
-    Groveton	Groveton, NH
-    Hadley	Hadley, MA
-    Hanover	Hanover, NH
-    Hubbard Corner	Castleton or Georgia
-    Huletts Landing	Huletts Landing, NY
-    Keene	Keene, NH
-    Lebanon	Lebanon, NH
-    Littleton	Littleton, NH
-    Lyme	Lyme, NH
-    Meredith	Meredith, NH
-    Miranda Morse	Unknown
-    Mooers	Mooers, NY
-    New London	New London, NH
-    Newcomb	Newcomb, NY
-    Not Porvided	Unknown
-    Orford	Orford, NH
-    Oxford	Oxford, CT
-    Piermont	Piermont, NH
-    Plattsburgh	Plattsburgh, NY
-    ST CATHERIE	Unknown
-    Salem	Salem, MA
-    Somerville	Somerville, MA
-    West West	Likely Westminster pr Putney
-    Whitehall	Whitehall, NY
-    Whitney	Unknown
-    Willsboro	Willsboro, NY
+    body = f"""
+    <html><body>
+    <p>- Weekly Groundwater Chemistry Analyte Exceedance Report -</p>
+    <p>Hello,</p>
+    <p>Analyte exceedances found for <b>{len(alert_records)}</b> record(s) in the last 7 days ending on {datetime.now().strftime('%Y-%m-%d')}.</p>
+    <p>The attached CSV file contains a downloadable copy of this data.</p>
+    {html_table}
+    <p>Contact the AHS GIS & Data Viz team for questions: ADS.VCGIAHSTechs@vermont.gov.</p>
+    <p>Thank you.</p>
+    </body></html>
     """
 
-    aliasDictionary = dict()
-    with arcpy.da.SearchCursor(groundwaterChemistryDatabaseGISAliasTable, ['Municipality', 'Town', 'Alias']) as searchCursor:
-        for row in searchCursor:
-            municipality = row[0]
-            town = row[1]
-            aliasList = row[2]
-            if town not in aliasDictionary:
-                aliasDictionary[town.lower()] = municipality
-            if municipality.lower() not in aliasDictionary:
-                aliasDictionary[municipality.lower()] = municipality
-            if aliasList != None:
-                for alias in aliasList.split(","):
-                    if alias not in aliasDictionary:
-                        aliasDictionary[alias.lower()] = municipality
+    today_text = datetime.now().strftime("%Y-%m-%d")
+    attachment_filename = f"Groundwater_Exceedance_Report_{today_text}.csv"
+    send_email_notification(body, email_sender, email_recipients, csv_output.getvalue(), attachment_filename)
+    csv_output.close()
 
-    fields = ['SampleLocationPhysicalAddress1','SampleLocationPhysicalAddressCi','SampleLocationPhysicalAddressZi']
-    with arcpy.da.UpdateCursor(groundwaterChemistryDatabaseGISTableCleanedInMemory, fields) as updateCursor:
-        for row in updateCursor:
-            address = row[0]
-            town = row[1].lower()
-            zipCode = row[2]
-            if address == None:
+
+# =====================================================================================
+# STEP 3 - Clean up sample locations and geocode them to map points.
+# =====================================================================================
+
+def fix_zip_codes(memory_table):
+    """
+    Cleans up a handful of known zip code formatting problems in the raw data: zip codes
+    that were entered with a leading dash instead of a zero, zip codes that were entered
+    starting with "1" where "0" was meant, and zip codes that are missing their leading
+    zero entirely (Vermont zips all start with 0).
+    """
+    dash_prefix_selection = arcpy.management.SelectLayerByAttribute(
+        memory_table, "NEW_SELECTION", "SampleLocationPhysicalAddressZi LIKE '-%'")
+    arcpy.management.CalculateField(
+        dash_prefix_selection, "SampleLocationPhysicalAddressZi",
+        "!SampleLocationPhysicalAddressZi!.replace('-','0')")
+
+    leading_one_selection = arcpy.management.SelectLayerByAttribute(
+        memory_table, "NEW_SELECTION", "SampleLocationPhysicalAddressZi LIKE '1%'")
+    arcpy.management.CalculateField(
+        leading_one_selection, "SampleLocationPhysicalAddressZi",
+        "'0' + !SampleLocationPhysicalAddressZi![1:5]")
+
+    missing_leading_zero_selection = arcpy.management.SelectLayerByAttribute(
+        memory_table, "NEW_SELECTION",
+        "SampleLocationPhysicalAddressZi NOT LIKE '0%' "
+        "AND SampleLocationPhysicalAddressZi NOT IN ('NA','VT','Not Report','Well')")
+    arcpy.management.CalculateField(
+        missing_leading_zero_selection, "SampleLocationPhysicalAddressZi",
+        "'0' + !SampleLocationPhysicalAddressZi!")
+
+
+def standardize_water_source_values(memory_table, water_source_standardization):
+    """
+    Standardizes the free-text "water source" field down to a short, consistent set of
+    values (Drilled Well, Dug Well, Well, Spring, or Unknown). When the source is a vague
+    catch-all value like "Other" or "Not Reported By Client", this also checks the
+    sampling-location description field for a more specific answer before giving up and
+    calling it Unknown.
+    """
+    vague_source_values = ("other", "not reported by client", "none")
+    specific_source_values = ("drilled well", "dug well", "well", "spring")
+
+    with arcpy.da.UpdateCursor(memory_table, ["WaterSource", "SamplingLocationDescription"]) as cursor:
+        for row in cursor:
+            water_source = str(row[0]).lower().strip()
+            location_description = str(row[1]).lower().strip()
+
+            if water_source in vague_source_values:
+                matched_source = next(
+                    (source for source in specific_source_values if source == location_description), None)
+                row[0] = water_source_standardization[matched_source] if matched_source else "Unknown"
+            elif water_source in water_source_standardization:
+                row[0] = water_source_standardization[water_source]
+            # otherwise leave the value as-is
+
+            cursor.updateRow(row)
+
+
+def build_town_alias_lookup(town_alias_table):
+    """
+    Builds a lookup dictionary that maps a lowercase town name (including known misspellings
+    and out-of-state towns) to its correct, standardized municipality name. Historically,
+    many SampleLocationPhysicalAddressCi values from labs turned out to be typos, out-of-state
+    towns bordering Vermont, or ambiguous placeholders - this table of known exceptions was
+    built up over time to correct them rather than discard the records outright. It would be
+    better to validate this at data-entry time, but that hasn't happened yet.
+    """
+    alias_lookup = {}
+    with arcpy.da.SearchCursor(town_alias_table, ["Municipality", "Town", "Alias"]) as cursor:
+        for municipality, town, alias_list in cursor:
+            if town.lower() not in alias_lookup:
+                alias_lookup[town.lower()] = municipality
+            if municipality.lower() not in alias_lookup:
+                alias_lookup[municipality.lower()] = municipality
+            if alias_list is not None:
+                for alias in alias_list.split(","):
+                    if alias not in alias_lookup:
+                        alias_lookup[alias.lower()] = municipality
+    return alias_lookup
+
+
+def apply_town_aliases(memory_table, town_alias_lookup):
+    """
+    Walks every record and, where possible, replaces a messy/misspelled town name with its
+    standardized municipality name using the lookup built by build_town_alias_lookup().
+    Also blanks out a few fields when they come back as database NULL, so downstream string
+    operations (like the address concatenation used for geocoding) don't choke on None.
+    """
+    fields = ["SampleLocationPhysicalAddress1", "SampleLocationPhysicalAddressCi", "SampleLocationPhysicalAddressZi"]
+    with arcpy.da.UpdateCursor(memory_table, fields) as cursor:
+        for row in cursor:
+            address, town, zip_code = row
+            if address is None:
                 row[0] = ""
-            elif town == None:
+            elif town is None:
                 row[1] = ""
-            elif zipCode == None:
+            elif zip_code is None:
                 row[2] = ""
-            if town in aliasDictionary:
-                townAlias = aliasDictionary[town]
-                row[1] = townAlias
-            updateCursor.updateRow(row)
 
-    # Update analyte names
-    analyteDictionary = {
-        'arsenic': 'Arsenic',
-        'arsenic total': 'Arsenic',
-        'sulfate': 'Sulfate',
-        'fluoride': 'Fluoride',
-        'total dissolved': 'TDS',
-        'tds': 'TDS',
-        'gross alpha': 'Gross Alpha',
-        'total nitrate/nitrite': 'Total Nitrate and Nitrite',
-        'nitrate & nitrite': 'Total Nitrate and Nitrite', 
-        'nitrate and nitrite as no3': 'Total Nitrate and Nitrite',
-        'total nitrate and nitrite as n': 'Total Nitrate and Nitrite',
-        'nitrate': 'Nitrate',
-        'nitrate as n': 'Nitrate',
-        'nitrite': 'Nitrite',
-        'nitrite as n': 'Nitrite',
-        'sodium': 'Sodium',
-        'chloride': 'Chloride',
-        'manganese': 'Manganese',
-        'lead': 'Lead',
-        'iron': 'Iron',
-        'copper': 'Copper',
-        'radon': 'Radon',
-        'radon-222': 'Radon',
-        'radon in water': 'Radon',
-        'uranium': 'Uranium',
-        'uranium total': 'Uranium',
-        'radium': 'Radium',
-        'radium-226': 'Radium',
-        'radium-228': 'Radium',
-        'radium-226/228': 'Radium',
-        'e. coli': 'E.coli',
-        'e.coli': 'E.coli',
-        'escherichia': 'E.coli',
-        'coliform': 'Total Coliform',
-        'coliforms': 'Total Coliform',
-        'turbidity': 'Turbidity',
-        'hardness': 'Hardness',
-        'odor': 'Odor',
-        'ph': 'pH',
-    }
+            if town is not None and town.lower() in town_alias_lookup:
+                row[1] = town_alias_lookup[town.lower()]
 
-    # Update Analyte Alias and Water Source, and find Water Source-Location Description matches and set mismatched to None
-    arcpy.management.AddField(groundwaterChemistryDatabaseGISTableCleanedInMemory, "AnalyteAlias","TEXT","","",200,"AnalyteAlias")
-    with arcpy.da.UpdateCursor(groundwaterChemistryDatabaseGISTableCleanedInMemory, ["AnalyteName","AnalyteAlias"]) as updateCursor:
-        for row in updateCursor:
-            analyteName = str(row[0]).lower().strip()
-            if analyteName in analyteDictionary:
-                analyteAlias = analyteDictionary[analyteName]
-                row[1] = analyteAlias
-            updateCursor.updateRow(row)
+            cursor.updateRow(row)
 
-    # Calculate fields for geocoding
-    # Address concatenation
-    selection = arcpy.management.SelectLayerByAttribute(groundwaterChemistryDatabaseGISTableCleanedInMemory,"NEW_SELECTION","""SampleLocationPhysicalAddressSt NOT IN ('TN','NH','KY','MA','ME','RI','MD','NJ','TX','CT','VA','NY')""")
-    addressConcatClause = """!SampleLocationPhysicalAddress1!+", "!SampleLocationPhysicalAddressCi!+", VT, "+!SampleLocationPhysicalAddressZi!"""
-    arcpy.management.CalculateField(selection,"ConcatAddress",addressConcatClause)
-    arcpy.management.SelectLayerByAttribute(groundwaterChemistryDatabaseGISTableCleanedInMemory,"CLEAR_SELECTION")
 
-    # Geocode Addresses
-    geocodedDataTableInMemory = "memory/geocodedAddresses"
+def standardize_analyte_names(memory_table, analyte_name_standardization):
+    """
+    Adds the AnalyteAlias field and populates it with a standardized analyte name wherever
+    the raw AnalyteName matches a known variant (for example "Arsenic Total" becomes
+    "Arsenic"). Records whose analyte isn't recognized are left with a blank AnalyteAlias,
+    and get filtered out later before anything is published.
+    """
+    arcpy.management.AddField(memory_table, "AnalyteAlias", "TEXT", "", "", 200, "AnalyteAlias")
+    with arcpy.da.UpdateCursor(memory_table, ["AnalyteName", "AnalyteAlias"]) as cursor:
+        for row in cursor:
+            analyte_name = str(row[0]).lower().strip()
+            if analyte_name in analyte_name_standardization:
+                row[1] = analyte_name_standardization[analyte_name]
+            cursor.updateRow(row)
+
+
+def geocode_sample_locations(memory_table, geocoder_url):
+    """
+    Geocodes every sample location to an X/Y point using the state's E911 address locator.
+    Builds a "street, city, VT, zip" address string for every record whose state is Vermont
+    (or blank/unknown), geocodes those addresses, and then geocodes any records that still
+    came back with no geometry a second time using just the town name, snapped to that
+    town's centroid - so most records end up with *some* point on the map, even if it's
+    only town-level precision.
+
+    Records that still can't be geocoded after both passes (addresses from the handful of
+    out-of-state codes that are never even attempted, or Vermont addresses that just don't
+    match anything) are NOT discarded. They're kept with no geometry, and their
+    ConcatAddress field - the same field already used to mark "<town> Centroid" and
+    "DELETE" rows - is set to a plain-language "EXCLUDED - ..." reason instead, so a
+    privileged user can later find and understand every record that never made it onto a
+    map. Returns the path to the final geocoded feature class.
+    """
+    geocode_eligible_selection = arcpy.management.SelectLayerByAttribute(
+        memory_table, "NEW_SELECTION",
+        "SampleLocationPhysicalAddressSt NOT IN "
+        "('TN','NH','KY','MA','ME','RI','MD','NJ','TX','CT','VA','NY')")
+    address_concat_expression = (
+        '!SampleLocationPhysicalAddress1!+", "!SampleLocationPhysicalAddressCi!+", VT, "+!SampleLocationPhysicalAddressZi!'
+    )
+    arcpy.management.CalculateField(geocode_eligible_selection, "ConcatAddress", address_concat_expression)
+    arcpy.management.SelectLayerByAttribute(memory_table, "CLEAR_SELECTION")
+
+    geocoded_points = "memory/geocodedAddresses"
     arcpy.geocoding.GeocodeAddresses(
-        groundwaterChemistryDatabaseGISTableCleanedInMemory,
-        address_locator="https://maps.vcgi.vermont.gov/arcgis/rest/services/EGC_services/GCS_E911_COMPOSITE_SP_v2/GeocodeServer/GCS_E911_COMPOSITE_SP_v2",
+        memory_table,
+        address_locator=geocoder_url,
         in_address_fields="'Single Line Input' ConcatAddress VISIBLE NONE",
-        out_feature_class=geocodedDataTableInMemory,
+        out_feature_class=geocoded_points,
         out_relationship_type="STATIC",
-        country=None,
-        location_type="",
-        category=None,
-        output_fields="LOCATION_ONLY"
+        country=None, location_type="", category=None,
+        output_fields="LOCATION_ONLY",
     )
 
-    arcpy.management.Delete(groundwaterChemistryDatabaseGISTableCleanedInMemory)
+    arcpy.management.Delete(memory_table)
 
-    # Geocode empty geometry records to town centroid
-    selection = arcpy.management.SelectLayerByAttribute(geocodedDataTableInMemory,"NEW_SELECTION","SHAPE IS NULL")
-    flattenedNullShapesInMemory = "memory/FlattenedNullShapes"
-    arcpy.conversion.TableToTable(selection,"memory","FlattenedNullShapes")
-    # Remove the null records from the geocoded data table - they will be replaced with the town centroid geocoding results
-    # Points from the null records that cannot be geocoded at all will be discarded
-    arcpy.management.DeleteFeatures(selection)
-    geocodedTownCentroidsInMemory = "memory/geocodedTownownCentroids"
+    # Anything that didn't geocode to a real address gets a second pass, geocoded to its
+    # town's centroid instead, so it still shows up somewhere on the map.
+    ungeocoded_selection = arcpy.management.SelectLayerByAttribute(geocoded_points, "NEW_SELECTION", "SHAPE IS NULL")
+    ungeocoded_records = "memory/FlattenedNullShapes"
+    arcpy.conversion.TableToTable(ungeocoded_selection, "memory", "FlattenedNullShapes")
+    arcpy.management.DeleteFeatures(ungeocoded_selection)
+
+    town_centroid_points = "memory/geocodedTownCentroids"
     arcpy.geocoding.GeocodeAddresses(
-        flattenedNullShapesInMemory,
-        address_locator="https://maps.vcgi.vermont.gov/arcgis/rest/services/EGC_services/GCS_E911_COMPOSITE_SP_v2/GeocodeServer/GCS_E911_COMPOSITE_SP_v2",
+        ungeocoded_records,
+        address_locator=geocoder_url,
         in_address_fields="'Single Line Input' SampleLocationPhysicalAddressCi VISIBLE NONE",
-        out_feature_class=geocodedTownCentroidsInMemory,
+        out_feature_class=town_centroid_points,
         out_relationship_type="STATIC",
-        country=None,
-        location_type="CENTROID",  # Ensure centroids are returned
-        category=None,
-        output_fields="LOCATION_ONLY"
+        country=None, location_type="CENTROID", category=None,
+        output_fields="LOCATION_ONLY",
+    )
+    geocoded_to_centroid_selection = arcpy.management.SelectLayerByAttribute(town_centroid_points, "NEW_SELECTION", "SHAPE IS NOT NULL")
+    arcpy.management.CalculateField(geocoded_to_centroid_selection, "ConcatAddress", "!SampleLocationPhysicalAddressCi! ' Centroid'")
+
+    # Still no geometry after both passes - keep the record, but mark why instead of
+    # deleting it. Split confirmed out-of-state (never had a real address to try) from
+    # everything else that simply didn't match anything. This has to be a NEW_SELECTION
+    # for the out-of-state case followed by a SWITCH_SELECTION for "everything else that's
+    # still null" - NOT a second explicit "NOT IN" clause - because SampleLocationPhysicalAddressSt
+    # is blank/NULL for a large share of records, and in SQL "NULL NOT IN (list)" is
+    # neither true nor false, so a second "NOT IN" clause would silently skip blank-state
+    # records and leave them untagged.
+    still_ungeocoded_out_of_state = arcpy.management.SelectLayerByAttribute(
+        town_centroid_points, "NEW_SELECTION",
+        "SHAPE IS NULL AND SampleLocationPhysicalAddressSt IN "
+        "('TN','NH','KY','MA','ME','RI','MD','NJ','TX','CT','VA','NY')")
+    arcpy.management.CalculateField(still_ungeocoded_out_of_state, "ConcatAddress", f"'{GEOCODE_EXCLUSION_OUT_OF_STATE_MARKER}'")
+
+    still_ungeocoded_everything_else = arcpy.management.SelectLayerByAttribute(
+        town_centroid_points, "NEW_SELECTION", "SHAPE IS NULL")
+    still_ungeocoded_everything_else = arcpy.management.SelectLayerByAttribute(
+        still_ungeocoded_everything_else, "REMOVE_FROM_SELECTION",
+        "SampleLocationPhysicalAddressSt IN ('TN','NH','KY','MA','ME','RI','MD','NJ','TX','CT','VA','NY')")
+    arcpy.management.CalculateField(still_ungeocoded_everything_else, "ConcatAddress", f"'{GEOCODE_EXCLUSION_NOT_GEOCODED_MARKER}'")
+
+    arcpy.management.Append(town_centroid_points, geocoded_points)
+    return geocoded_points
+
+
+def clean_and_geocode_points(raw_data_memory_table, town_alias_table, town_boundaries):
+    """
+    Runs the full location-cleanup pipeline on the raw data: fixes zip codes, standardizes
+    water source and analyte names, replaces messy town names with their standardized
+    alias, geocodes every record to a point (falling back to a town centroid when a full
+    address can't be geocoded), and finally spatially joins each point to the Vermont town
+    it falls within. Returns the path to the resulting joined points feature class.
+    """
+    fix_zip_codes(raw_data_memory_table)
+    standardize_water_source_values(raw_data_memory_table, WATER_SOURCE_STANDARDIZATION)
+
+    town_alias_lookup = build_town_alias_lookup(town_alias_table)
+    apply_town_aliases(raw_data_memory_table, town_alias_lookup)
+    standardize_analyte_names(raw_data_memory_table, ANALYTE_NAME_STANDARDIZATION)
+
+    geocoded_points = geocode_sample_locations(raw_data_memory_table, E911_GEOCODER_URL)
+
+    joined_points = "memory/GWCDPoints_TownJoin"
+    arcpy.analysis.SpatialJoin(
+        geocoded_points, town_boundaries, joined_points,
+        "JOIN_ONE_TO_ONE", "KEEP_ALL", "", "INTERSECT", "", "")
+    arcpy.management.Delete(geocoded_points)
+
+    return joined_points
+
+
+# =====================================================================================
+# STEP 4 - Filter out records that shouldn't be published, calculate per-record exceedance
+# flags, de-duplicate, and roll up to town/analyte summary statistics.
+# =====================================================================================
+
+def _sql_in_list(values):
+    """Turns a Python tuple of strings into a SQL 'a','b','c' list, quoted correctly."""
+    return ",".join(f"'{value}'" for value in values)
+
+
+def build_published_record_filter_clause():
+    """
+    Builds the SQL where-clause used to decide which records are allowed to be published
+    at all (as opposed to kept only for internal exceedance calculations). This excludes
+    rejected/invalid results, public/municipal water sources (this script is about PRIVATE
+    drinking water), records from schools, daycares, and other institutional clients whose
+    results aren't meaningful as "household drinking water" data, post-treatment samples,
+    and records that could never be matched to a Vermont town (couldn't be geocoded at
+    all, or landed outside every town boundary). This is the one filter clause shared by
+    both the exceedance-calculation step and the final publish step below, so the two can
+    never disagree with each other.
+
+    Note: the IS NULL checks throughout are required - in SQL, NULL is never considered
+    "in" or "not in" a list, so without them any record with a NULL value in one of these
+    fields would be silently excluded even though it should pass.
+    """
+    return (
+        f"(Result IS NULL OR lower(Result) NOT IN ({_sql_in_list(REJECTED_RESULT_TEXT_VALUES)})) AND "
+        f"(WHCombinedResult IS NULL OR lower(WHCombinedResult) NOT IN ({_sql_in_list(REJECTED_RESULT_TEXT_VALUES)})) AND "
+        f"(WaterSource IS NULL OR lower(WaterSource) NOT IN ({_sql_in_list(EXCLUDED_WATER_SOURCE_VALUES)})) AND "
+        f"(ClientName IS NULL OR lower(ClientName) NOT IN ({_sql_in_list(EXCLUDED_CLIENT_NAME_VALUES)})) AND "
+        f"(SamplingLocationDescription IS NULL OR lower(SamplingLocationDescription) NOT IN "
+        f"({_sql_in_list(EXCLUDED_SAMPLING_LOCATION_DESCRIPTION_VALUES)})) AND "
+        "(lower(PostTreatmentSample) = 'n' OR PostTreatmentSample IS NULL) AND "
+        "(TOWNNAME IS NOT NULL)"
     )
 
-    arcpy.management.CalculateField(geocodedTownCentroidsInMemory,"ConcatAddress","!SampleLocationPhysicalAddressCi! ' Centroid'")
-    selection = arcpy.management.SelectLayerByAttribute(geocodedTownCentroidsInMemory,"NEW_SELECTION","SHAPE IS NULL")
-    arcpy.management.DeleteFeatures(selection)
 
-    # Combine address-located points with town centroid points
-    arcpy.management.Append(geocodedTownCentroidsInMemory,geocodedDataTableInMemory)
-
-    # Join towns to points
-    joinedPointsInMemory = "memory/GWCDPoints_TownJoin"
-    arcpy.analysis.SpatialJoin(geocodedDataTableInMemory, townBounds, "memory/GWCDPoints_TownJoin", "JOIN_ONE_TO_ONE", "KEEP_ALL", "", "INTERSECT", "", "")
-    arcpy.management.Delete(geocodedDataTableInMemory)
-
-    return joinedPointsInMemory
+def add_exceedance_calculation_fields(joined_points):
+    """
+    Adds the numeric fields used throughout the exceedance calculation step: a per-record
+    Count flag, the ResultCalc value actually used for comparisons, and one Above.../flag
+    field for each of the four threshold types (MCL, SMCL, VHA, and Vermont's own
+    "Threshold" level).
+    """
+    for field_name in ("Count", "ResultCalc", "AboveMCL", "AboveSMCL", "AboveVHA", "AboveThreshold"):
+        arcpy.management.AddField(joined_points, field_name, "DOUBLE")
 
 
-joinedPointsInMemory = GetJoinedPoints(groundwaterChemistryDatabaseGISTableCleanedInMemory, groundwaterChemistryDatabaseGISAliasTable, townBounds)
+def calculate_result_and_exceedances(selection, exceedance_thresholds):
+    """
+    For every selected record, this:
+      1. Converts Uranium and Chloride results from micrograms/liter (or picocuries/liter,
+         for Uranium) into milligrams/liter, so they're comparable to the thresholds below.
+      2. Sets ResultCalc to the actual lab result, or - for a non-detect with a numeric
+         reporting limit - to half the reporting limit (a standard way of estimating a
+         "most likely" value for a result below the detection limit).
+      3. Compares ResultCalc against that analyte's MCL/SMCL/VHA/Threshold limits and sets
+         the corresponding AboveMCL/AboveSMCL/AboveVHA/AboveThreshold flag to 1 (above), 0
+         (at or below), or leaves it as None (can't be determined, e.g. a non-detect with
+         no numeric reporting limit).
+    E.coli, Total Coliform, pH, and Hardness are handled as a special case afterward,
+    since they're reported as present/absent text, a pH range, or a hardness range rather
+    than a simple numeric exceedance.
+    """
+    fields = [
+        "WHResultValueNumeric", "AnalyteAlias", "ResultUnit", "ReportingLimit", "ReportingLimitUnit",
+        "Result", "Count", "ResultCalc", "WHResultType", "AboveMCL", "AboveSMCL", "AboveVHA",
+        "AboveThreshold", "WHResultValueAlpha",
+    ]
 
-def PrepareFieldsAndCalculateExceedances(joinedPointsInMemory):
-
-    # Add new fields to the in-memory table
-    calc_fields = ['Count', 'ResultCalc','AboveMCL', 'AboveSMCL', 'AboveVHA', 'AboveThreshold']
-    for field in calc_fields:
-        arcpy.management.AddField(joinedPointsInMemory, field, "DOUBLE")
-
-    # Set Count to 1 if Result is not Null
-    # Converting ResultValueNumeric and ReportingLimit fields from ug/L to mg/L if Uranium (VOCs are all reported in ug/L, so only some will be changed)
-    # Set ResultCalc to equal 1/2 the reporting limit if non-detect
-    # Exceedance dict, in order of MCL, SMCL, VHA, Threshold
-    # Temp edit for nitrate and nitrite threshold to be 0 for flood analysis
-
-    microtomiliAndExceedanceFields = ["WHResultValueNumeric","AnalyteAlias","ResultUnit","ReportingLimit","ReportingLimitUnit","Result","Count",
-                                    "ResultCalc","WHResultType","AboveMCL","AboveSMCL","AboveVHA","AboveThreshold","WHResultValueAlpha"]
-
-    # exceedenceDictionary structure: mcl, smcl, vha, threshold
-    # for pH there are two smcl values
-    # for hardness there are two threshold values
-    exceedanceDictionary = {
-        "Arsenic": (0.010, None, None, 0.001),
-        "Fluoride": (4.000, 2.000, None, 0.700),
-        "Gross Alpha": (15, None, None, 5),
-        "Nitrate": (10, None, 5, 0),
-        "Nitrite": (1, None, None, 0),
-        "Total Nitrate and Nitrite": (10, None, None, 5),
-        "Sodium": (None, 250, None, 15),
-        "Chloride": (None, 250, None, 50),
-        "Manganese": (None, 0.05, 0.3, 0.08),
-        "Lead": (0.015, None, 0.001, None),
-        "Iron": (None, 0.3, None, None),
-        "Copper": (1.3, 1, 1.3, None),
-        "Radon": (None, None, 4000, None),
-        "Uranium": (0.03, None, 0.02, None),
-        "Radium": (5, None, None, None),
-        "TDS": (None, 500, None, None),
-        "Turbidity": (None, None, None, 1),
-        "Odor": (None, 3, None, None),
-        "E.coli": (0, None, None, 0),
-        "Total Coliform": (None, None, None, 0),
-        "pH": (None, (6.5, 8.5), None, None),
-        "Hardness": (None, None, None, (75, 151))
+    unit_conversions = {
+        ("Uranium", "ug/L"): ("mg/L", 0.001),
+        ("Chloride", "ug/L"): ("mg/L", 0.001),
+        ("Uranium", "pCi/L"): ("mg/L", 0.00149),
     }
 
-    # Create selection set to run calculations on
-    # Note the explicit calls of IS NULL
-    # Those are needed because the NOT IN method will automatically exclude NULL values
-    #  because NULL is not considered to be "in" or "not in" any list, so without the IS NULL checks,
-    #  any record with a NULL value in those fields would be excluded from the selection, even if they meet all the other criteria.
-    clause = (
-        "(Result IS NULL OR lower(Result) NOT IN "
-        "('rejected','na','n/a','rejection','no data','nd','not tested',"
-        "'nda','error','see attached','')) AND "
+    with arcpy.da.UpdateCursor(selection, fields) as cursor:
+        for row in cursor:
+            (result_value, analyte_name, result_unit, reporting_limit, reporting_limit_unit,
+             result, count, result_calc, result_type, above_mcl, above_smcl, above_vha,
+             above_threshold, result_value_alpha) = row
 
-        "(WHCombinedResult IS NULL OR lower(WHCombinedResult) NOT IN "
-        "('rejected','na','n/a','rejection','no data','nd','not tested',"
-        "'nda','error','error in result','see attached')) AND "
+            count = None if result is None else 1
 
-        "(WaterSource IS NULL OR lower(WaterSource) NOT IN "
-        "('public','surface','lake/pond','river','stream','municipal')) AND "
+            conversion = unit_conversions.get((analyte_name, result_unit))
+            if conversion:
+                new_unit, factor = conversion
+                result_value = result_value * factor
+                result_unit = new_unit
+                if reporting_limit is not None:
+                    reporting_limit = reporting_limit * factor
+                    reporting_limit_unit = new_unit
 
-        "(ClientName IS NULL OR lower(ClientName) NOT IN "
-        "('learning','school','elem','elementary','daycare','childcare',"
-        "'district','childhood','uvmmc','vt agriculture environmental lab',"
-        "'early ed','uvm-','uvm','city market','vt agency of agriculture',"
-        "'vdh quarterly','vdh lab','vdh laboratory','vdh bottle','uhs',"
-        "'child care','environmental health','childrens','academy')) AND "
-
-        "(SamplingLocationDescription IS NULL OR "
-        "lower(SamplingLocationDescription) NOT IN "
-        "('learning','school','elem','elementary','daycare','childcare',"
-        "'district','childhood','uvmmc','early ed','uvm-','vdh laboratory')) AND "
-
-        "(lower(PostTreatmentSample) = 'n' OR PostTreatmentSample IS NULL)"
-    )
-
-    calculationSelection = arcpy.management.SelectLayerByAttribute(joinedPointsInMemory,"NEW_SELECTION",clause)
-    
-    # export joinedPointsInMemory in excel format for records where radon in derby
-    # create a selection for radon in derby
-    #clauseRadonDerby = "AnalyteAlias = 'Radon' AND TOWNNAME = 'DERBY'"
-    #calculationSelectionRadonDerby = arcpy.management.SelectLayerByAttribute(joinedPointsInMemory,"NEW_SELECTION",clauseRadonDerby)
-    #outputExcelPath = r"D:/ScratchSpace/Radon_Derby_Records.xlsx"
-    #arcpy.conversion.TableToExcel(calculationSelectionRadonDerby, outputExcelPath)
-
-    #clause = "lower(Result) NOT IN ('rejected','na','n/a','rejection','no data','nd','not tested','nda','error','see attached','') And " \
-    #    "lower(WHCombinedResult) NOT IN ('rejected','na','n/a','rejection','no data','nd','not tested','nda','error','see attached','') And " \
-    #    "lower(WaterSource) NOT IN ('public','surface','lake/pond','river','stream','municipal') And " \
-    #    "lower(ClientName) NOT IN ('learning','school','elem','elementary','daycare','childcare','district','childhood','uvmmc','VT Agriculture Environmental Lab','early ed','uvm-','uvm','City Market','VT AGENCY OF AGRICULTURE','VDH Quarterly','vdh lab','vdh laboratory','vdh bottle','uhs','child care','environmental health','childrens','academy') And " \
-    #    "lower(SamplingLocationDescription) NOT IN ('learning','school','elem','elementary','daycare','childcare','district','childhood','uvmmc','early ed','uvm-','vdh laboratory') And" \
-    #    "(lower(PostTreatmentSample) = 'n' OR PostTreatmentSample IS Null) And " \
-    #        "AnalyteAlias = 'Radon' AND TOWNNAME = 'DERBY'"
-    # subselection of calculuationSelection that is Radon in DERBY
-    #calcRadon = arcpy.management.SelectLayerByAttribute(joinedPointsInMemory, "NEW_SELECTION", clause)
-    #arcpy.management.GetCount(calcRadon)
-    #arcpy.management.GetCount(calculationSelection)
-
-
-
-    with arcpy.da.UpdateCursor(calculationSelection, microtomiliAndExceedanceFields) as updateCursor:
-        for row in updateCursor:
-            WHResultValueNumeric,AnalyteName,ResultUnit,ReportingLimit,ReportingLimitUnit, \
-            Result,Count,ResultCalc,WHResultType,AboveMCL,AboveSMCL,AboveVHA,AboveThreshold,WHResultValueAlpha = row
-
-            # Set count values to 1 when there is a result (most results are Analyte 'odor' test results, some are values when odor is irrelevant)
-            Count = None if Result is None else 1
-
-            # Converting ResultValueNumeric and ReportingLimit fields for Uranium and Chloride from ug/L to mg/L
-            # and pCI/L to mg/L for Uranium (VOCs are all reported in ug/L so Vic didn't want to change them all)
-            if AnalyteName == "Uranium" and ResultUnit == "ug/L":
-                WHResultValueNumeric = WHResultValueNumeric * 0.001
-                ResultUnit = "mg/L"
-                if ReportingLimit is not None:
-                    ReportingLimit = ReportingLimit * 0.001
-                    ReportingLimitUnit = "mg/L"
-            elif AnalyteName == "Chloride" and ResultUnit == "ug/L":
-                WHResultValueNumeric = WHResultValueNumeric * 0.001
-                ResultUnit = "mg/L"
-                if ReportingLimit is not None:
-                    ReportingLimit = ReportingLimit * 0.001
-                    ReportingLimitUnit = "mg/L"
-            elif AnalyteName == "Uranium" and ResultUnit == "pCi/L":
-                WHResultValueNumeric = WHResultValueNumeric * 0.00149
-                ResultUnit = "mg/L"
-                if ReportingLimit is not None:
-                    ReportingLimit = ReportingLimit * 0.00149
-                    ReportingLimitUnit = "mg/L"
-
-            # Setting ResultCalc to equal 1/2 the reporting limit if non-detect
-            if WHResultType == "<" and AnalyteName not in ["Total Coliform","E.coli","Hardness"]:
-                if ReportingLimit is not None:
-                    ResultCalc = ReportingLimit/2
+            # A non-detect ("<") uses half the reporting limit as a stand-in result value,
+            # except for the three analytes handled as a special case below.
+            if result_type == "<" and analyte_name not in ("Total Coliform", "E.coli", "Hardness"):
+                if reporting_limit is not None:
+                    result_calc = reporting_limit / 2
             else:
-                ResultCalc = WHResultValueNumeric
+                result_calc = result_value
 
-            # Exceedance Calculations ===================================================================================== HANDLE THE UNUSED ANALYTE VALUES
-            if AnalyteName in exceedanceDictionary and AnalyteName not in ["Total Coliform","E.coli","Hardness","pH"]:
-                mcl, smcl, vha, threshold = exceedanceDictionary[AnalyteName]
-                if ResultCalc:
-                    AboveMCL = 1 if mcl and ResultCalc > mcl else 0 if mcl and ResultCalc <= mcl else None
-                    AboveSMCL = 1 if smcl and ResultCalc > smcl else 0 if smcl and ResultCalc <= smcl else None
-                    AboveVHA = 1 if vha and ResultCalc > vha else 0 if vha and ResultCalc <= vha else None
-                    AboveThreshold = 1 if threshold and ResultCalc > threshold else 0 if threshold and ResultCalc <= threshold else None
+            if analyte_name in exceedance_thresholds and analyte_name not in ("Total Coliform", "E.coli", "Hardness", "pH"):
+                thresholds = exceedance_thresholds[analyte_name]
+                mcl, smcl, vha, threshold = thresholds["mcl"], thresholds["smcl"], thresholds["vha"], thresholds["threshold"]
+                if result_calc:
+                    above_mcl = 1 if mcl and result_calc > mcl else 0 if mcl and result_calc <= mcl else None
+                    above_smcl = 1 if smcl and result_calc > smcl else 0 if smcl and result_calc <= smcl else None
+                    above_vha = 1 if vha and result_calc > vha else 0 if vha and result_calc <= vha else None
+                    above_threshold = 1 if threshold and result_calc > threshold else 0 if threshold and result_calc <= threshold else None
 
-            elif AnalyteName in ["E.coli","Total Coliform","pH","Hardness"]:
-                mcl, smcl, vha, threshold = exceedanceDictionary[AnalyteName]
-                ecoli = AnalyteName == "E.coli"
-                total_coliform = AnalyteName == "Total Coliform"
-                ph = AnalyteName == "pH"
-                hardness = AnalyteName == "Hardness"
-                present_or_detected = WHResultValueAlpha in {"Present", "Detected"}
-                absent_or_not_detected = WHResultValueAlpha in {"Absent", "Not detected"}
-                equal_or_greater = WHResultType in {"=", ">"}
-                less_than = WHResultType == "<"
+            elif analyte_name in ("E.coli", "Total Coliform", "pH", "Hardness"):
+                thresholds = exceedance_thresholds[analyte_name]
+                mcl, smcl, vha, threshold = thresholds["mcl"], thresholds["smcl"], thresholds["vha"], thresholds["threshold"]
+                is_ecoli = analyte_name == "E.coli"
+                is_total_coliform = analyte_name == "Total Coliform"
+                is_ph = analyte_name == "pH"
+                is_hardness = analyte_name == "Hardness"
+                is_present_or_detected = result_value_alpha in {"Present", "Detected"}
+                is_absent_or_not_detected = result_value_alpha in {"Absent", "Not detected"}
+                is_equal_or_greater = result_type in {"=", ">"}
+                is_less_than = result_type == "<"
 
                 if mcl:
-                    if ResultCalc is None:
-                        if total_coliform:
-                            AboveMCL = 1 if present_or_detected else 0 if absent_or_not_detected else None
-                    elif ResultCalc is not None:
-                        if total_coliform:
-                            AboveMCL = 1 if ResultCalc > mcl and equal_or_greater else 0 if (ResultCalc == 1 and (equal_or_greater or less_than)) or (ResultCalc < mcl) else None
+                    if result_calc is None:
+                        if is_total_coliform:
+                            above_mcl = 1 if is_present_or_detected else 0 if is_absent_or_not_detected else None
                     else:
-                        AboveMCL = None
+                        if is_total_coliform:
+                            above_mcl = (
+                                1 if result_calc > mcl and is_equal_or_greater
+                                else 0 if (result_calc == 1 and (is_equal_or_greater or is_less_than)) or (result_calc < mcl)
+                                else None
+                            )
 
-                if smcl and ResultCalc is not None and ph:
-                    AboveSMCL = 1 if ResultCalc < smcl[0] or ResultCalc > smcl[1] else 0 if ResultCalc >= smcl[0] and ResultCalc <= smcl[1] else None
+                if smcl and result_calc is not None and is_ph:
+                    above_smcl = 1 if result_calc < smcl[0] or result_calc > smcl[1] else 0 if smcl[0] <= result_calc <= smcl[1] else None
 
-                if ecoli:
-                    if ResultCalc is None:
-                        AboveMCL = 1 if present_or_detected else 0 if absent_or_not_detected else None
-                    elif ResultCalc is not None:
-                        AboveMCL = 1 if ResultCalc > mcl and equal_or_greater else 0 if ResultCalc < mcl or less_than else None
+                if is_ecoli:
+                    if result_calc is None:
+                        above_mcl = 1 if is_present_or_detected else 0 if is_absent_or_not_detected else None
                     else:
-                        AboveMCL = None
+                        above_mcl = 1 if result_calc > mcl and is_equal_or_greater else 0 if result_calc < mcl or is_less_than else None
 
-                if total_coliform:
-                    if ResultCalc is None:
-                        AboveThreshold = 1 if present_or_detected else 0 if absent_or_not_detected else None
-                    elif ResultCalc is not None:
-                        AboveThreshold = 1 if ResultCalc > threshold and equal_or_greater else 0 if (ResultCalc == 1 and (equal_or_greater or less_than)) or (ResultCalc < threshold) else None
-
-                elif threshold and hardness and ResultCalc is not None:
-                    AboveThreshold = 1 if ResultCalc < threshold[0] or ResultCalc > threshold[1] else 0 if ResultCalc >= threshold[0] and ResultCalc <= threshold[1] else None
+                if is_total_coliform:
+                    if result_calc is None:
+                        above_threshold = 1 if is_present_or_detected else 0 if is_absent_or_not_detected else None
+                    else:
+                        above_threshold = (
+                            1 if result_calc > threshold and is_equal_or_greater
+                            else 0 if (result_calc == 1 and (is_equal_or_greater or is_less_than)) or (result_calc < threshold)
+                            else None
+                        )
+                elif threshold and is_hardness and result_calc is not None:
+                    above_threshold = 1 if result_calc < threshold[0] or result_calc > threshold[1] else 0 if threshold[0] <= result_calc <= threshold[1] else None
                 else:
-                    AboveThreshold = None
-            
-            updatedRow = (WHResultValueNumeric,AnalyteName,ResultUnit,ReportingLimit,ReportingLimitUnit,
-                Result,Count,ResultCalc,WHResultType,AboveMCL,AboveSMCL,AboveVHA,AboveThreshold,WHResultValueAlpha)
-            
-            updateCursor.updateRow(updatedRow)
+                    above_threshold = None
 
-    # Summary of what the calculation above are doing:
-    # 1. Count is set to 1 if there is a result value, otherwise it is set to None. 
-    #       This is used for counting the number of results for a given analyte/location grouping, but doesn't count non-detects that don't have a numeric result value.
-    # 2. ResultCalc is the field used for all exceedance calculations, 
-    #       and is set to the numeric result value when there is a value, 
-    #       and set to 1/2 the reporting limit when there is a non-detect with a numeric reporting limit. 
-    #       If there is a non-detect without a numeric reporting limit, ResultCalc is set to None and it is not included in any exceedance calculations.
-    # 3. AboveMCL, AboveSMCL, AboveVHA, and AboveThreshold are set to 1 when the ResultCalc value exceeds the respective exceedance level, 
-    #       0 when it is at or below the exceedance level, 
-    #       and None when it cannot be determined if it is above or below the exceedance level (e.g. non-detect without a numeric reporting limit).
+            cursor.updateRow((
+                result_value, analyte_name, result_unit, reporting_limit, reporting_limit_unit,
+                result, count, result_calc, result_type, above_mcl, above_smcl, above_vha,
+                above_threshold, result_value_alpha,
+            ))
 
 
-    # Account for multiple records for the same analyte at the same geocoded address
-    # If the result is numeric, the highest result will be kept for a unique address. If not numeric, the most recent reported date/time is taken.
-    unique_records = {}
-    unique_location_fields = ["ConcatAddress", "AnalyteAlias", "TOWNNAME", "ResultCalc", "Record_uid", "ReportedDateTime", "AboveThreshold"]
-    with arcpy.da.SearchCursor(calculationSelection, unique_location_fields) as cursor:
-        for row in cursor:
-            concatAddress,analyteName,townName,resultCalc,record_uid,reportedDateTime,aboveThreshold = row
-            key = (concatAddress, analyteName, townName)
+def remove_duplicate_location_records(selection):
+    """
+    When the same address has more than one result for the same analyte, this keeps only
+    one: the highest numeric result (or, for E.coli/Total Coliform without a numeric
+    result, the one most recently reported that shows "above threshold"). Every other
+    record for that address/analyte/town combination is marked for deletion by setting
+    its ConcatAddress to "DELETE" (the caller is responsible for actually removing those
+    rows afterward).
+    """
+    fields = ["ConcatAddress", "AnalyteAlias", "TOWNNAME", "ResultCalc", "Record_uid", "ReportedDateTime", "AboveThreshold"]
+    best_record_by_location = {}
 
-            if key not in unique_records:
-                unique_records[key] = (resultCalc, record_uid, reportedDateTime, aboveThreshold)
-            else:
-                existing_result, existing_record_uid, existing_reported_datetime, existing_above_threshold = unique_records[key]
+    with arcpy.da.SearchCursor(selection, fields) as cursor:
+        for concat_address, analyte_name, town_name, result_calc, record_uid, reported_date, above_threshold in cursor:
+            location_key = (concat_address, analyte_name, town_name)
+            candidate = (result_calc, record_uid, reported_date, above_threshold)
 
-                # Check if the current record and existing record are not None
-                if resultCalc is not None and existing_result is not None:
-                    # Compare the Result_Calc values
-                    if resultCalc > existing_result:
-                        unique_records[key] = (resultCalc, record_uid, reportedDateTime, aboveThreshold)
-                    elif resultCalc == existing_result and reportedDateTime is not None and existing_reported_datetime is not None:
-                        if reportedDateTime > existing_reported_datetime:
-                            unique_records[key] = (resultCalc, record_uid, reportedDateTime, aboveThreshold)
-                elif resultCalc is not None:
-                    # Handle case where existing_result is None
-                    unique_records[key] = (resultCalc, record_uid, reportedDateTime, aboveThreshold)
-
-                # Add the new condition here
-                elif resultCalc is None and analyteName in ["Total Coliform", "E.coli"]:
-                    # Check if the AboveThreshold value should be updated
-                    if aboveThreshold == 1 and existing_above_threshold == 0:
-                        unique_records[key] = (resultCalc, record_uid, reportedDateTime, aboveThreshold)
-                    elif aboveThreshold == 1 and existing_above_threshold == 1:
-                        # Check if reported_datetime and existing_reported_datetime are not None
-                        if reportedDateTime is not None and existing_reported_datetime is not None:
-                            # Compare reported_datetime for records with AboveThreshold = 1
-                            if reportedDateTime > existing_reported_datetime:
-                                unique_records[key] = (resultCalc, record_uid, reportedDateTime, aboveThreshold)
-
-    # Final passing of unique analyte/location records to keep
-    records_to_keep = set()
-    for result_calc, record_uid, reported_datetime, _ in unique_records.values():
-        records_to_keep.add(record_uid)
-
-    # Updating in memory copy of GWCDedit to delete record UIDs not in records_to_keep
-    # Mark records to delete using ConcatAddress field
-    with arcpy.da.UpdateCursor(calculationSelection, ["Record_uid","ConcatAddress"]) as updateCursor:
-        for row in updateCursor:
-            if row[0] not in records_to_keep:
-                row[1] = "DELETE"
-                updateCursor.updateRow(row)
-                #updateCursor.deleteRow()
-
-    # Exceedance Summation Calculations (based on unique AnalyteName and spatial TOWNNAME groupings)
-    # The following fields are added and summarized by this index: CityCount, [CityAboveMCL,SMCL,VHA,Threshold], [PctAboveMCL,SMCL,VHA,Threshold], Mean, Median, Min, Max, Percentile95, StdDev
-    # Mean, Median, Min, Max, Percentile95, StdDev are based on the ResultCalc field, so if a record was non-detect, half of the reporting limit is used
-
-    gwcdinmem_fields = [field.name for field in arcpy.ListFields(calculationSelection)]
-    # Read the data using a search cursor and store it in a defaultdict
-    data = defaultdict(list)
-    with arcpy.da.SearchCursor(calculationSelection, gwcdinmem_fields) as cursor:
-        for row in cursor:
-            analyte_name = row[gwcdinmem_fields.index('AnalyteAlias')]
-            town_name = row[gwcdinmem_fields.index('TOWNNAME')]
-            if town_name is not None and analyte_name is not None:
-                analyte_city = analyte_name + '|' + town_name
-                data[analyte_city].append(row)
-            else:
-                pass
-
-    # Calculate the required values for each unique combination of 'AnalyteName' and 'City'
-    unique_results = {}
-    for analyte_city, records in data.items():
-        result_calcs = [record[gwcdinmem_fields.index('ResultCalc')] for record in records if record[gwcdinmem_fields.index('ResultCalc')] is not None]
-        num_above_mcl = [record[gwcdinmem_fields.index('AboveMCL')] for record in records if record[gwcdinmem_fields.index('AboveMCL')] is not None]
-        num_above_smcl = [record[gwcdinmem_fields.index('AboveSMCL')] for record in records if record[gwcdinmem_fields.index('AboveSMCL')] is not None]
-        num_above_vha = [record[gwcdinmem_fields.index('AboveVHA')] for record in records if record[gwcdinmem_fields.index('AboveVHA')] is not None]
-        num_above_threshold = [record[gwcdinmem_fields.index('AboveThreshold')] for record in records if record[gwcdinmem_fields.index('AboveThreshold')] is not None]
-        count = [record[gwcdinmem_fields.index('Count')] for record in records if record[gwcdinmem_fields.index('Count')] is not None]
-        analyte_name_value = records[0][gwcdinmem_fields.index('AnalyteAlias')]
-
-        if result_calcs:
-                if analyte_name_value == "Arsenic":
-                    round_mean = round_median = round_min = round_max = round_percentile95 = round_stddev = 4
-                elif analyte_name_value == "Fluoride":
-                    round_mean = round_median = round_min = round_max = round_percentile95 = round_stddev = 3
-                elif analyte_name_value == "Gross Alpha":
-                    round_mean = round_median = round_min = round_max = round_percentile95 = round_stddev = 1
-                elif analyte_name_value == "Nitrate":
-                    round_mean = round_median = round_min = round_max = round_percentile95 = round_stddev = 4
-                elif analyte_name_value == "Radon":
-                    round_mean = round_median = round_min = round_max = round_percentile95 = round_stddev = 1
-                elif analyte_name_value == "Uranium":
-                    round_mean = round_median = round_min = round_max = round_percentile95 = round_stddev = 6
-                else:
-                    round_mean = round_median = round_min = round_max = round_percentile95 = round_stddev = 6  # Default rounding
-
-        if result_calcs:
-            unique_results[analyte_city] = {
-                'CityCount': round(sum(count)),
-                'CityAboveMCL': round(sum(num_above_mcl)) if num_above_mcl else None,
-                'CityAboveSMCL': round(sum(num_above_smcl)) if num_above_smcl else None,
-                'CityAboveVHA': round(sum(num_above_vha)) if num_above_vha else None,
-                'CityAboveThreshold': round(sum(num_above_threshold)) if num_above_threshold else None,
-                'PctAboveMCL': round((sum(num_above_mcl) / sum(count)) * 100, 1) if num_above_mcl else None,
-                'PctAboveSMCL': round((sum(num_above_smcl) / sum(count)) * 100, 1) if num_above_smcl else None,
-                'PctAboveVHA': round((sum(num_above_vha) / sum(count)) * 100, 1) if num_above_vha else None,
-                'PctAboveThreshold': round((sum(num_above_threshold) / sum(count)) * 100, 1) if num_above_threshold else None,
-                'Mean': round(np.mean(result_calcs), round_mean),
-                'Median': round(np.median(result_calcs), round_median),
-                'Min_': round(np.min(result_calcs), round_min),
-                'Max_': round(np.max(result_calcs), round_max),
-                'Percentile95': round(np.percentile(result_calcs, 95), round_percentile95),
-                'StdDev': round(np.std(result_calcs), round_stddev)
-            }
-
-    # Add the new fields to the in-memory table
-    unique_calc_fields = ['CityCount', 'CityAboveMCL', 'CityAboveSMCL', 'CityAboveVHA', 'CityAboveThreshold', 'PctAboveMCL', 'PctAboveSMCL', 'PctAboveVHA', 'PctAboveThreshold', 'Mean', 'Median', 'Min_', 'Max_', 'Percentile95', 'StdDev']
-    for field in unique_calc_fields:
-        arcpy.AddField_management(calculationSelection, field, "DOUBLE")
-
-    gwcdtable_fields = [field.name for field in arcpy.ListFields(calculationSelection)]
-    with arcpy.da.UpdateCursor(calculationSelection, gwcdtable_fields) as cursor:
-        for row in cursor:
-            analyte_name = row[gwcdinmem_fields.index('AnalyteAlias')]
-            town_name = row[gwcdinmem_fields.index('TOWNNAME')]
-
-            if analyte_name is not None and town_name is not None:
-                analyte_city = analyte_name + '|' + town_name
-
-                # Check if analyte_city exists in unique_results before updating fields
-                if analyte_city in unique_results:
-                    for field in unique_calc_fields:
-                        row[gwcdtable_fields.index(field)] = unique_results[analyte_city][field]
-                    cursor.updateRow(row)
-
-    return calculationSelection, groundwaterChemistryDatabaseGISPoints
-
-
-joinedPointsInMemory, groundwaterChemistryDatabaseGISPoints = PrepareFieldsAndCalculateExceedances(joinedPointsInMemory)
-
-# Append all points to SQL
-arcpy.management.SelectLayerByAttribute(joinedPointsInMemory,"CLEAR_SELECTION")
-arcpy.management.DeleteFeatures(groundwaterChemistryDatabaseGISPoints)
-arcpy.management.Append(joinedPointsInMemory, groundwaterChemistryDatabaseGISPoints, "NO_TEST")
-
-
-# Make the same selection to remove records prior to creating the external table
-    # Note the explicit calls of IS NULL
-    # Those are needed because the NOT IN method will automatically exclude NULL values
-    #  because NULL is not considered to be "in" or "not in" any list, so without the IS NULL checks,
-    #  any record with a NULL value in those fields would be excluded from the selection, even if they meet all the other criteria.
-clause = (
-    "(Result IS NULL OR lower(Result) NOT IN "
-    "('rejected','na','n/a','rejection','no data','nd','not tested',"
-    "'nda','error','see attached','')) AND "
-
-    "(WHCombinedResult IS NULL OR lower(WHCombinedResult) NOT IN "
-    "('rejected','na','n/a','rejection','no data','nd','not tested',"
-    "'nda','error','see attached','')) AND "
-
-    "(WaterSource IS NULL OR lower(WaterSource) NOT IN "
-    "('public','surface','lake/pond','river','stream','municipal')) AND "
-
-    "(ClientName IS NULL OR lower(ClientName) NOT IN "
-    "('learning','school','elem','elementary','daycare','childcare',"
-    "'district','childhood','uvmmc','vt agriculture environmental lab',"
-    "'early ed','uvm-','uvm','city market','vt agency of agriculture',"
-    "'vdh quarterly','vdh lab','vdh laboratory','vdh bottle','uhs',"
-    "'child care','environmental health','childrens','academy')) AND "
-
-    "(SamplingLocationDescription IS NULL OR "
-    "lower(SamplingLocationDescription) NOT IN "
-    "('learning','school','elem','elementary','daycare','childcare',"
-    "'district','childhood','uvmmc','early ed','uvm-','vdh laboratory')) AND "
-
-    "(lower(PostTreatmentSample) = 'n' OR PostTreatmentSample IS NULL)"
-)
-       
-selection = arcpy.management.SelectLayerByAttribute(joinedPointsInMemory,"NEW_SELECTION",clause)
-selection = arcpy.management.SelectLayerByAttribute(selection,"SWITCH_SELECTION")
-arcpy.management.DeleteRows(selection)
-
-# Remove duplicates per town and nulls in the analyte alias field
-fields = "AnalyteAlias;TOWNNAME;TOWNNAMEMC;CityCount;CityAboveMCL;CityAboveSMCL;CityAboveVHA;CityAboveThreshold;PctAboveMCL;PctAboveSMCL;PctAboveVHA;PctAboveThreshold;Mean;Median;Min_;Max_;Percentile95;StdDev"
-arcpy.management.DeleteField(joinedPointsInMemory, fields, 'KEEP_FIELDS')
-arcpy.management.DeleteIdentical(joinedPointsInMemory, fields)
-arcpy.management.MakeFeatureLayer(joinedPointsInMemory, "joinedPointsInMemory_lyr")
-arcpy.management.SelectLayerByAttribute("joinedPointsInMemory_lyr","NEW_SELECTION","AnalyteAlias = ''")
-arcpy.management.DeleteFeatures("joinedPointsInMemory_lyr")
-arcpy.management.Delete("joinedPointsInMemory_lyr")
-
-# Flatten points to a table
-externalTableInMemory = "memory/ExternalTableInMemory"
-arcpy.conversion.TableToTable(joinedPointsInMemory, "memory", "ExternalTableInMemory")
-arcpy.management.Delete(joinedPointsInMemory)
-# Add pop-up calculations for web app
-mapFields = ["MapMean","MapMedian","MapMin","MapMax","MapPercentile95","MapStdDev","MapMDL"]
-for field in mapFields:
-    arcpy.management.AddField(externalTableInMemory, field, "TEXT", "", "", 100, field)
-arcpy.management.AddField(externalTableInMemory, "MapPopupHeading", "TEXT", "", "", 255, "MapPopupHeading")
-fields = ["AnalyteAlias","Mean","Median","Min_","Max_","Percentile95","StdDev",
-          "MapMean","MapMedian","MapMin","MapMax","MapPercentile95","MapStdDev","MapMDL","MapPopupHeading",
-          "CityAboveMCL","PctAboveMCL","CityAboveThreshold","PctAboveThreshold","CityAboveVHA","PctAboveVHA","CityAboveSMCL","PctAboveSMCL",
-          "TOWNNAME","CityCount"]
-
-with arcpy.da.UpdateCursor(externalTableInMemory, fields) as updateCursor:
-    for row in updateCursor:
-        analyteAlias,mean,median,min_,max_,percentile95,stdDev, \
-        mapMean,mapMedian,mapMin,mapMax,mapPercentile95,mapStdDev,mapMDL,mapPopupHeading, \
-        cityAboveMCL,pctAboveMCL,cityAboveThreshold,pctAboveThreshold,cityAboveVHA,pctAboveVHA,CityAboveSMCL,PctAboveSMCL, \
-        townName,cityCount = row
-
-        # Suppress those towns with fewer than 20 samples
-        if cityCount is not None:
-            if float(cityCount) < 20:
-                updateCursor.deleteRow()
+            if location_key not in best_record_by_location:
+                best_record_by_location[location_key] = candidate
                 continue
-        
-        if mean is not None:
 
-            if analyteAlias == "Arsenic":
-                cityAboveValue = cityAboveMCL
-                pctAboveValue = pctAboveMCL
-                thresholdValue = "MCL (0.010 mg/L)"
-                popupFooterThreshold = 0.001
-                popupFooterUnits = "mg/L"
-            elif analyteAlias == "Fluoride":
-                cityAboveValue = cityAboveThreshold
-                pctAboveValue = pctAboveThreshold
-                thresholdValue = "PHS (0.7 mg/L)"
-                popupFooterThreshold = 0.3
-                popupFooterUnits = "mg/L"
-            elif analyteAlias == "Gross Alpha":
-                cityAboveValue = cityAboveMCL
-                pctAboveValue = pctAboveMCL
-                thresholdValue = "MCL (15 pCi/L)"
-                popupFooterThreshold = 1.50
-                popupFooterUnits = "pCi/L"
-            elif analyteAlias == "Nitrate":
-                cityAboveValue = cityAboveMCL
-                pctAboveValue = pctAboveMCL
-                thresholdValue = "MRL (10 mg/L)"
-                popupFooterThreshold = 0.5
-                popupFooterUnits = "mg/L"
-            elif analyteAlias == "Radon":
-                cityAboveValue = cityAboveVHA
-                pctAboveValue = pctAboveVHA
-                thresholdValue = "VHA (4,000 pCi/L)"
-                popupFooterThreshold = 100
-                popupFooterUnits = "pCi/L"
-            elif analyteAlias == "Uranium":
-                cityAboveValue = cityAboveVHA
-                pctAboveValue = pctAboveVHA
-                thresholdValue = "VMCL (0.020 mg/L)"
-                popupFooterThreshold = 0.001
-                popupFooterUnits = "mg/L"
-            else:
-                cityAboveValue = None
-                pctAboveValue = None
-                thresholdValue = None
-                popupFooterThreshold = None
-                popupFooterUnits = None
+            existing_result, existing_record_uid, existing_reported_date, existing_above_threshold = best_record_by_location[location_key]
 
-            if cityAboveValue in [0,None]:
-                mapPopupHeading = f"There are no {analyteAlias.lower()} tests above the {thresholdValue} in {townName}."
-            else:
-                mapPopupHeading = f"{round(pctAboveValue,1)} % of {analyteAlias.lower()} tests ({cityAboveValue} out of {cityCount}) are above the {thresholdValue} in {townName}."
+            if result_calc is not None and existing_result is not None:
+                if result_calc > existing_result:
+                    best_record_by_location[location_key] = candidate
+                elif result_calc == existing_result and reported_date and existing_reported_date and reported_date > existing_reported_date:
+                    best_record_by_location[location_key] = candidate
+            elif result_calc is not None:
+                best_record_by_location[location_key] = candidate
+            elif result_calc is None and analyte_name in ("Total Coliform", "E.coli"):
+                if above_threshold == 1 and existing_above_threshold == 0:
+                    best_record_by_location[location_key] = candidate
+                elif above_threshold == 1 and existing_above_threshold == 1 and reported_date and existing_reported_date:
+                    if reported_date > existing_reported_date:
+                        best_record_by_location[location_key] = candidate
 
-            mapMean = "*" if mean < 0.001 else str(round(mean,3)) + f" {popupFooterUnits}"
-            mapMedian = "*" if median < 0.001 else str(round(median,3)) + f" {popupFooterUnits}"
-            mapMin = "*" if min_ < 0.001 else str(round(min_,3)) + f" {popupFooterUnits}"
-            mapMax = "*" if max_ < 0.001 else str(round(max_,3)) + f" {popupFooterUnits}"
-            mapPercentile95 = "*" if percentile95 < 0.001 else str(round(percentile95,3)) + f" {popupFooterUnits}"
-            mapStdDev = "*" if stdDev < 0.001 else str(round(stdDev,3)) + f" {popupFooterUnits}"
-            mapMDL = (f"* Less than the reporting limit (RL) of the laboratory test, typically {str(popupFooterThreshold)} {popupFooterUnits} for {analyteAlias.lower()}."
-                    if any(stat < 0.001 for stat in [mean, median, min_, max_, percentile95, stdDev])
-                    else "")
+    record_uids_to_keep = {record_uid for _, record_uid, _, _ in best_record_by_location.values()}
 
-        updatedRow = (analyteAlias,mean,median,min_,max_,percentile95,stdDev, \
-                mapMean,mapMedian,mapMin,mapMax,mapPercentile95,mapStdDev,mapMDL,mapPopupHeading, \
-                cityAboveMCL,pctAboveMCL,cityAboveThreshold,pctAboveThreshold,cityAboveVHA,pctAboveVHA,CityAboveSMCL,PctAboveSMCL, \
-                townName,cityCount)
-        
-        updateCursor.updateRow(updatedRow)
+    with arcpy.da.UpdateCursor(selection, ["Record_uid", "ConcatAddress"]) as cursor:
+        for row in cursor:
+            if row[0] not in record_uids_to_keep:
+                row[1] = "DELETE"
+                cursor.updateRow(row)
 
-# Append to SQL
-arcpy.management.DeleteRows(groundwaterChemistryDatabaseGISPointTableExternal)
-arcpy.management.Append(externalTableInMemory, groundwaterChemistryDatabaseGISPointTableExternal, "NO_TEST")
 
-# Rebuild indexes
-# (commented-out alternate indexing calls redacted - referenced an internal server path)
-arcpy.management.RebuildIndexes(GDBEnvHealthEditor, "NO_SYSTEM", os.path.basename(groundwaterChemistryDatabaseGISTable), "ALL")
-arcpy.management.RebuildIndexes(GDBEnvHealthEditor, "NO_SYSTEM", os.path.basename(groundwaterChemistryDatabaseGISPoints), "ALL")
-arcpy.management.RebuildIndexes(GDBEnvHealthEditor, "NO_SYSTEM", os.path.basename(groundwaterChemistryDatabaseGISPointTableExternal), "ALL")
-
-# Update data updated date field
-
-# Azure AD App Registration details
-# NOTE: real credentials redacted for this public-facing copy.
-client_id = "<REDACTED>"
-client_secret = "<REDACTED>"
-tenant_id = "<REDACTED>"
-
-# SharePoint and file details
-site_url = "vermontgov.sharepoint.com:/teams/AHS.GISAdministrationGroup"
-list_id = "<REDACTED_LIST_ID>"
-
-# Step 1: Get access token from Azure AD
-url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-headers = {
-    'Content-Type': 'application/x-www-form-urlencoded'
+# Decimal places to round summary statistics to, per analyte. Chosen so that typical
+# results for that analyte don't get rounded down to zero.
+SUMMARY_STAT_ROUNDING_BY_ANALYTE = {
+    "Arsenic": 4, "Fluoride": 3, "Gross Alpha": 1, "Nitrate": 4, "Radon": 1, "Uranium": 6,
 }
-data = {
-    'grant_type': 'client_credentials',
-    'client_id': client_id,
-    'client_secret': client_secret,
-    'scope': 'https://graph.microsoft.com/.default'
-}
-response = requests.post(url, headers=headers, data=data)
-response.raise_for_status()
-access_token = response.json().get('access_token')
+DEFAULT_SUMMARY_STAT_ROUNDING = 6
 
-# Step 2: Get the site ID
-endpoint = f"https://graph.microsoft.com/v1.0/sites/{site_url}"
-headers = {
-    'Authorization': f'Bearer {access_token}'
-}
-response = requests.get(endpoint, headers=headers)
-response.raise_for_status()
-site_id = response.json().get('id')
 
-adjusted_time = datetime.now() + timedelta(hours=4)
-new_date = adjusted_time.isoformat() + "Z"
+def summarize_by_town_and_analyte(selection):
+    """
+    Rolls the (already de-duplicated) records up into one summary row per town/analyte
+    combination: how many samples, how many and what percent were above each threshold
+    type, and the mean/median/min/max/95th percentile/standard deviation of the results.
+    Writes those summary values back onto every record sharing that town/analyte so the
+    later flatten-and-publish step can pull a single representative row per combination.
+    """
+    all_field_names = [field.name for field in arcpy.ListFields(selection)]
 
-headers = {
-    "Authorization": f"Bearer {access_token}",
-    "Accept": "application/json",
-    "Content-Type": "application/json"
-}
+    records_by_town_and_analyte = defaultdict(list)
+    with arcpy.da.SearchCursor(selection, all_field_names) as cursor:
+        for row in cursor:
+            analyte_name = row[all_field_names.index("AnalyteAlias")]
+            town_name = row[all_field_names.index("TOWNNAME")]
+            if analyte_name is not None and town_name is not None:
+                records_by_town_and_analyte[f"{analyte_name}|{town_name}"].append(row)
 
-# Step 1: Get all list items
-url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items?expand=fields"
-response = requests.get(url, headers=headers)
+    def field_values(records, field_name):
+        index = all_field_names.index(field_name)
+        return [record[index] for record in records if record[index] is not None]
 
-items = response.json().get("value", [])
+    summary_by_town_and_analyte = {}
+    for key, records in records_by_town_and_analyte.items():
+        result_values = field_values(records, "ResultCalc")
+        if not result_values:
+            continue
 
-for item in items:
-    item_id = item.get("id")
-    fields = item.get("fields", {})
-    if fields.get("ApplicationDomain1") == "Groundwater Chemistry":
-        update_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items/{item_id}/fields"
-        payload = {
-            "LatestDataUpdate": new_date
+        above_mcl_values = field_values(records, "AboveMCL")
+        above_smcl_values = field_values(records, "AboveSMCL")
+        above_vha_values = field_values(records, "AboveVHA")
+        above_threshold_values = field_values(records, "AboveThreshold")
+        sample_counts = field_values(records, "Count")
+        analyte_name = records[0][all_field_names.index("AnalyteAlias")]
+        rounding = SUMMARY_STAT_ROUNDING_BY_ANALYTE.get(analyte_name, DEFAULT_SUMMARY_STAT_ROUNDING)
+        total_samples = sum(sample_counts)
+
+        summary_by_town_and_analyte[key] = {
+            "CityCount": round(total_samples),
+            "CityAboveMCL": round(sum(above_mcl_values)) if above_mcl_values else None,
+            "CityAboveSMCL": round(sum(above_smcl_values)) if above_smcl_values else None,
+            "CityAboveVHA": round(sum(above_vha_values)) if above_vha_values else None,
+            "CityAboveThreshold": round(sum(above_threshold_values)) if above_threshold_values else None,
+            "PctAboveMCL": round((sum(above_mcl_values) / total_samples) * 100, 1) if above_mcl_values else None,
+            "PctAboveSMCL": round((sum(above_smcl_values) / total_samples) * 100, 1) if above_smcl_values else None,
+            "PctAboveVHA": round((sum(above_vha_values) / total_samples) * 100, 1) if above_vha_values else None,
+            "PctAboveThreshold": round((sum(above_threshold_values) / total_samples) * 100, 1) if above_threshold_values else None,
+            "Mean": round(np.mean(result_values), rounding),
+            "Median": round(np.median(result_values), rounding),
+            "Min_": round(np.min(result_values), rounding),
+            "Max_": round(np.max(result_values), rounding),
+            "Percentile95": round(np.percentile(result_values, 95), rounding),
+            "StdDev": round(np.std(result_values), rounding),
         }
-        patch_resp = requests.patch(update_url, headers=headers, json=payload)
+
+    summary_field_names = [
+        "CityCount", "CityAboveMCL", "CityAboveSMCL", "CityAboveVHA", "CityAboveThreshold",
+        "PctAboveMCL", "PctAboveSMCL", "PctAboveVHA", "PctAboveThreshold",
+        "Mean", "Median", "Min_", "Max_", "Percentile95", "StdDev",
+    ]
+    for field_name in summary_field_names:
+        arcpy.management.AddField(selection, field_name, "DOUBLE")
+
+    all_field_names = [field.name for field in arcpy.ListFields(selection)]
+    with arcpy.da.UpdateCursor(selection, all_field_names) as cursor:
+        for row in cursor:
+            analyte_name = row[all_field_names.index("AnalyteAlias")]
+            town_name = row[all_field_names.index("TOWNNAME")]
+            if analyte_name is None or town_name is None:
+                continue
+            key = f"{analyte_name}|{town_name}"
+            if key not in summary_by_town_and_analyte:
+                continue
+            for field_name in summary_field_names:
+                row[all_field_names.index(field_name)] = summary_by_town_and_analyte[key][field_name]
+            cursor.updateRow(row)
 
 
+def calculate_exceedances_and_summaries(joined_points, record_filter_clause, exceedance_thresholds):
+    """
+    Runs the full exceedance-calculation pipeline on the geocoded/joined points: selects
+    only the records allowed to be published, computes each record's ResultCalc value and
+    MCL/SMCL/VHA/Threshold exceedance flags, removes duplicate records for the same
+    address/analyte, and rolls everything up into town/analyte summary statistics. Returns
+    the resulting selection, ready to be appended to the live points feature class.
+    """
+    add_exceedance_calculation_fields(joined_points)
+    selection = arcpy.management.SelectLayerByAttribute(joined_points, "NEW_SELECTION", record_filter_clause)
 
-# Long to wide csv export
-# ===================================================================
+    calculate_result_and_exceedances(selection, exceedance_thresholds)
+    remove_duplicate_location_records(selection)
+    summarize_by_town_and_analyte(selection)
 
-# --- 1. Configuration ---
-OUTPUT_ITEM_TITLE = 'PivotedGroundwaterData'
-AGOL_PORTAL_URL = 'https://ahs-vt.maps.arcgis.com/'
-AGOL_FOLDER_NAME = 'Water Quality Internal'
+    return selection
 
-fields_of_interest = ["AnalyteAlias", "ConcatAddress", "Result", "ResultUnit", "SampleCollectionDateTime"]
 
-unique_analytes = tuple(set([row[0] for row in arcpy.da.SearchCursor(
-    groundwaterChemistryDatabaseGISPoints, ["AnalyteAlias"]
-) if row[0] is not None and row[0] != '']))
+# =====================================================================================
+# STEP 5 - Build the final, flattened external/public summary table and publish
+# everything to SDE.
+# =====================================================================================
 
-clause = f"lower(ConcatAddress) NOT IN ('delete') AND lower(ConcatAddress) NOT LIKE '%centroid%' AND AnalyteAlias IN {unique_analytes}"
+def build_external_public_table(joined_points, record_filter_clause):
+    """
+    Starting from the calculated points, this removes any record that fails the shared
+    publish filter (records marked "DELETE" by the de-duplication step are removed as a
+    side effect of this, since they fail the filter in other ways too), trims the table
+    down to just the town/analyte summary fields, removes duplicate town/analyte rows, and
+    drops any record with a blank AnalyteAlias. The result is one row per town/analyte
+    combination, ready to be turned into map-popup text. Returns the path to the flattened
+    table.
+    """
+    excluded_selection = arcpy.management.SelectLayerByAttribute(joined_points, "NEW_SELECTION", record_filter_clause)
+    excluded_selection = arcpy.management.SelectLayerByAttribute(excluded_selection, "SWITCH_SELECTION")
+    arcpy.management.DeleteRows(excluded_selection)
 
-numpy_array = arcpy.da.TableToNumPyArray(
-    groundwaterChemistryDatabaseGISPoints, fields_of_interest, where_clause=clause
-)
-df = pd.DataFrame(numpy_array)
-df.sort_values(['ConcatAddress', 'AnalyteAlias', 'SampleCollectionDateTime'], inplace=True)
-df['sample_num'] = df.groupby(['ConcatAddress', 'AnalyteAlias']).cumcount() + 1
+    arcpy.management.DeleteField(joined_points, EXTERNAL_PUBLIC_TABLE_FIELDS, "KEEP_FIELDS")
+    arcpy.management.DeleteIdentical(joined_points, EXTERNAL_PUBLIC_TABLE_FIELDS)
 
-wide_df = df.pivot_table(
-    index=['ConcatAddress', 'AnalyteAlias'],
-    columns='sample_num',
-    values=['Result', 'ResultUnit', 'SampleCollectionDateTime'],
-    aggfunc='first'
-)
+    layer_name = "joined_points_layer"
+    arcpy.management.MakeFeatureLayer(joined_points, layer_name)
+    arcpy.management.SelectLayerByAttribute(layer_name, "NEW_SELECTION", "AnalyteAlias = ''")
+    arcpy.management.DeleteFeatures(layer_name)
+    arcpy.management.Delete(layer_name)
 
-wide_df.columns = [f'{val}{num}' for val, num in wide_df.columns]
-wide_df.reset_index(inplace=True)
+    flattened_table = "memory/ExternalTableInMemory"
+    arcpy.conversion.TableToTable(joined_points, "memory", "ExternalTableInMemory")
+    arcpy.management.Delete(joined_points)
+    return flattened_table
 
-key_cols = ['AnalyteAlias', 'ConcatAddress']
-data_cols = sorted(
-    [col for col in wide_df.columns if col not in key_cols],
-    key=lambda x: (int("".join(filter(str.isdigit, x))), x)
-)
 
-wide_df = wide_df[key_cols + data_cols]
+def add_map_popup_text(flattened_table, public_map_analyte_settings):
+    """
+    Adds the plain-language popup text fields used by the public map (MapMean, MapMedian,
+    MapMin, MapMax, MapPercentile95, MapStdDev, MapMDL, and MapPopupHeading), and suppresses
+    any town/analyte combination with fewer than 20 samples by deleting that row entirely -
+    this is the one safeguard between a small, potentially identifiable sample size and the
+    public map, so it needs to stay in place. Values below the lab's typical reporting
+    limit are shown as "*" with a footnote, rather than a precise number that implies more
+    precision than the lab actually measured.
+    """
+    text_fields = ["MapMean", "MapMedian", "MapMin", "MapMax", "MapPercentile95", "MapStdDev", "MapMDL"]
+    for field_name in text_fields:
+        arcpy.management.AddField(flattened_table, field_name, "TEXT", "", "", 100, field_name)
+    arcpy.management.AddField(flattened_table, "MapPopupHeading", "TEXT", "", "", 255, "MapPopupHeading")
 
-date_cols = wide_df.filter(like='SampleCollectionDateTime').columns
-for col in date_cols:
-    wide_df[col] = pd.to_datetime(wide_df[col]).dt.strftime('%Y-%m-%d %H:%M:%S')
+    fields = [
+        "AnalyteAlias", "Mean", "Median", "Min_", "Max_", "Percentile95", "StdDev",
+        "MapMean", "MapMedian", "MapMin", "MapMax", "MapPercentile95", "MapStdDev", "MapMDL", "MapPopupHeading",
+        "CityAboveMCL", "PctAboveMCL", "CityAboveThreshold", "PctAboveThreshold",
+        "CityAboveVHA", "PctAboveVHA", "CityAboveSMCL", "PctAboveSMCL",
+        "TOWNNAME", "CityCount",
+    ]
 
-temp_dir = tempfile.gettempdir()
-output_csv_path = os.path.join(temp_dir, f"{OUTPUT_ITEM_TITLE}.csv")
-output_zip_path = os.path.join(temp_dir, f"{OUTPUT_ITEM_TITLE}.zip")
+    with arcpy.da.UpdateCursor(flattened_table, fields) as cursor:
+        for row in cursor:
+            (analyte_alias, mean, median, min_value, max_value, percentile95, std_dev,
+             map_mean, map_median, map_min, map_max, map_percentile95, map_std_dev, map_mdl, map_popup_heading,
+             city_above_mcl, pct_above_mcl, city_above_threshold, pct_above_threshold,
+             city_above_vha, pct_above_vha, city_above_smcl, pct_above_smcl,
+             town_name, city_count) = row
 
-wide_df.to_csv(output_csv_path, index=False, encoding='utf-8')
-with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-    zf.write(output_csv_path, arcname=os.path.basename(output_csv_path))
+            # Suppress any town/analyte combination with too few samples to publish.
+            if city_count is not None and float(city_count) < 20:
+                cursor.deleteRow()
+                continue
 
-gis = GIS(AGOL_PORTAL_URL, username=agoUsername, password=agoPassword)
-query = f'title:"{OUTPUT_ITEM_TITLE}" AND owner:{gis.users.me.username}'
-search_results = gis.content.search(query=query, item_type='CSV')
+            if mean is not None:
+                settings = public_map_analyte_settings.get(analyte_alias)
+                if settings:
+                    exceedance_field_values = {
+                        "MCL": (city_above_mcl, pct_above_mcl),
+                        "Threshold": (city_above_threshold, pct_above_threshold),
+                        "VHA": (city_above_vha, pct_above_vha),
+                    }
+                    city_above_value, pct_above_value = exceedance_field_values[settings["exceedance_type"]]
+                    threshold_label = settings["threshold_label"]
+                    non_detect_display_threshold = settings["non_detect_display_threshold"]
+                    units = settings["units"]
+                else:
+                    city_above_value = pct_above_value = threshold_label = non_detect_display_threshold = units = None
 
-existing_item = next((item for item in search_results if item.title == OUTPUT_ITEM_TITLE), None)
+                if city_above_value in (0, None):
+                    map_popup_heading = f"There are no {analyte_alias.lower()} tests above the {threshold_label} in {town_name}."
+                else:
+                    map_popup_heading = (
+                        f"{round(pct_above_value, 1)} % of {analyte_alias.lower()} tests "
+                        f"({city_above_value} out of {city_count}) are above the {threshold_label} in {town_name}."
+                    )
 
-existing_item.update(data=output_zip_path)
-if os.path.exists(output_csv_path):
-    os.remove(output_csv_path)
-if os.path.exists(output_zip_path):
-    os.remove(output_zip_path)
+                def format_stat(value):
+                    return "*" if value < 0.001 else f"{round(value, 3)} {units}"
+
+                map_mean = format_stat(mean)
+                map_median = format_stat(median)
+                map_min = format_stat(min_value)
+                map_max = format_stat(max_value)
+                map_percentile95 = format_stat(percentile95)
+                map_std_dev = format_stat(std_dev)
+                map_mdl = (
+                    f"* Less than the reporting limit (RL) of the laboratory test, typically "
+                    f"{non_detect_display_threshold} {units} for {analyte_alias.lower()}."
+                    if any(value < 0.001 for value in (mean, median, min_value, max_value, percentile95, std_dev))
+                    else ""
+                )
+
+            cursor.updateRow((
+                analyte_alias, mean, median, min_value, max_value, percentile95, std_dev,
+                map_mean, map_median, map_min, map_max, map_percentile95, map_std_dev, map_mdl, map_popup_heading,
+                city_above_mcl, pct_above_mcl, city_above_threshold, pct_above_threshold,
+                city_above_vha, pct_above_vha, city_above_smcl, pct_above_smcl,
+                town_name, city_count,
+            ))
+
+
+def rebuild_table_indexes(editor_connection, tables):
+    """
+    Rebuilds the database indexes on the given tables. Run after the heavy delete/append
+    refresh above, since large inserts/deletes can leave indexes fragmented.
+    """
+    for table in tables:
+        arcpy.management.RebuildIndexes(editor_connection, "NO_SYSTEM", os.path.basename(table), "ALL")
+
+
+# =====================================================================================
+# STEP 6 - Update the "data last refreshed" date on SharePoint.
+# =====================================================================================
+
+def update_sharepoint_last_updated_date(azure_client_id, azure_client_secret, azure_tenant_id,
+                                         site_url, list_id, application_domain):
+    """
+    Updates the "LatestDataUpdate" field on the SharePoint list item for the Groundwater
+    Chemistry application domain, so staff can see at a glance when this data was last
+    refreshed. This talks to Microsoft Graph using an Azure AD app registration (client
+    credentials flow). This step isn't critical to the data pipeline itself, so any
+    failure here is caught, printed as a warning, and doesn't stop the rest of the script.
+    """
+    try:
+        token_response = requests.post(
+            f"https://login.microsoftonline.com/{azure_tenant_id}/oauth2/v2.0/token",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "client_credentials",
+                "client_id": azure_client_id,
+                "client_secret": azure_client_secret,
+                "scope": "https://graph.microsoft.com/.default",
+            },
+        )
+        token_response.raise_for_status()
+        access_token = token_response.json().get("access_token")
+        auth_headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json", "Content-Type": "application/json"}
+
+        site_response = requests.get(f"https://graph.microsoft.com/v1.0/sites/{site_url}", headers=auth_headers)
+        site_response.raise_for_status()
+        site_id = site_response.json().get("id")
+
+        # SharePoint stores this as UTC; adding 4 hours nudges it to display correctly in
+        # Vermont's local time zone on the list view.
+        display_adjusted_time = (datetime.now() + timedelta(hours=4)).isoformat() + "Z"
+
+        items_response = requests.get(
+            f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items?expand=fields",
+            headers=auth_headers)
+        items_response.raise_for_status()
+
+        for item in items_response.json().get("value", []):
+            if item.get("fields", {}).get("ApplicationDomain1") == application_domain:
+                update_response = requests.patch(
+                    f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items/{item['id']}/fields",
+                    headers=auth_headers,
+                    json={"LatestDataUpdate": display_adjusted_time},
+                )
+                update_response.raise_for_status()
+                print("SharePoint 'last updated' date refreshed successfully.")
+
+    except Exception as error:
+        print(f"Warning: failed to update the SharePoint 'last updated' date: {error}")
+
+
+# =====================================================================================
+# STEP 7 - Republish the long-to-wide pivoted CSV export to ArcGIS Online.
+# =====================================================================================
+
+def build_wide_format_dataframe(points_feature_class):
+    """
+    Pulls every published point record and reshapes it from "one row per sample" (long
+    format) into "one row per address/analyte, with Result1/ResultUnit1/SampleDate1,
+    Result2/ResultUnit2/SampleDate2, etc. for repeat samples" (wide format). This is a
+    separate, internal-use export - it isn't used by either public-facing map.
+    """
+    fields_of_interest = ["AnalyteAlias", "ConcatAddress", "Result", "ResultUnit", "SampleCollectionDateTime"]
+
+    known_analytes = tuple(sorted({
+        row[0] for row in arcpy.da.SearchCursor(points_feature_class, ["AnalyteAlias"])
+        if row[0]
+    }))
+    where_clause = (
+        f"lower(ConcatAddress) NOT IN ('delete') AND lower(ConcatAddress) NOT LIKE '%centroid%' "
+        f"AND lower(ConcatAddress) NOT LIKE 'excluded%' AND AnalyteAlias IN {known_analytes}"
+    )
+
+    numpy_array = arcpy.da.TableToNumPyArray(points_feature_class, fields_of_interest, where_clause=where_clause)
+    long_format_df = pd.DataFrame(numpy_array)
+    long_format_df.sort_values(["ConcatAddress", "AnalyteAlias", "SampleCollectionDateTime"], inplace=True)
+    long_format_df["sample_num"] = long_format_df.groupby(["ConcatAddress", "AnalyteAlias"]).cumcount() + 1
+
+    wide_format_df = long_format_df.pivot_table(
+        index=["ConcatAddress", "AnalyteAlias"],
+        columns="sample_num",
+        values=["Result", "ResultUnit", "SampleCollectionDateTime"],
+        aggfunc="first",
+    )
+    wide_format_df.columns = [f"{value_name}{sample_num}" for value_name, sample_num in wide_format_df.columns]
+    wide_format_df.reset_index(inplace=True)
+
+    key_columns = ["AnalyteAlias", "ConcatAddress"]
+    data_columns = sorted(
+        (column for column in wide_format_df.columns if column not in key_columns),
+        key=lambda column: (int("".join(filter(str.isdigit, column))), column),
+    )
+    wide_format_df = wide_format_df[key_columns + data_columns]
+
+    for date_column in wide_format_df.filter(like="SampleCollectionDateTime").columns:
+        wide_format_df[date_column] = pd.to_datetime(wide_format_df[date_column]).dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    return wide_format_df
+
+
+def publish_pivoted_csv_to_agol(points_feature_class, ago_username, ago_password):
+    """
+    Builds the wide-format CSV export and uploads it to ArcGIS Online, replacing the
+    existing "PivotedGroundwaterData" item's data. This is a non-critical, internal-use
+    export, so any failure here is caught, printed as a warning, and doesn't stop the
+    rest of the script. Always cleans up its temporary files, even if something goes wrong.
+    """
+    temp_dir = tempfile.gettempdir()
+    csv_path = os.path.join(temp_dir, f"{PIVOTED_CSV_ITEM_TITLE}.csv")
+    zip_path = os.path.join(temp_dir, f"{PIVOTED_CSV_ITEM_TITLE}.zip")
+
+    try:
+        wide_format_df = build_wide_format_dataframe(points_feature_class)
+        wide_format_df.to_csv(csv_path, index=False, encoding="utf-8")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            zip_file.write(csv_path, arcname=os.path.basename(csv_path))
+
+        gis = GIS(AGOL_PORTAL_URL, username=ago_username, password=ago_password)
+        search_results = gis.content.search(
+            query=f'title:"{PIVOTED_CSV_ITEM_TITLE}" AND owner:{gis.users.me.username}', item_type="CSV")
+        existing_item = next((item for item in search_results if item.title == PIVOTED_CSV_ITEM_TITLE), None)
+
+        if existing_item is None:
+            print(f"Warning: could not find an existing AGOL item titled '{PIVOTED_CSV_ITEM_TITLE}' to update.")
+            return
+
+        existing_item.update(data=zip_path)
+        print("Pivoted CSV republished to ArcGIS Online successfully.")
+
+    except Exception as error:
+        print(f"Warning: failed to republish the pivoted CSV to ArcGIS Online: {error}")
+
+    finally:
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+
+
+# =====================================================================================
+# STEP 8 - Characterize every record whose location did not geocode cleanly, for
+# privileged internal review. No new fields or app widgets - this just reads the
+# internal points table (ConcatAddress already carries the geocode outcome, written by
+# geocode_sample_locations() above) and republishes a CSV report to AGOL, the same way
+# the pivoted CSV export already does.
+# =====================================================================================
+
+def generate_excluded_records_report(points_feature_class):
+    """
+    Scans every record on the (already-refreshed) internal points table and builds a
+    report of every record whose address did not geocode to a real street-level match:
+    records that failed to geocode at all (tagged "EXCLUDED - ..." in ConcatAddress by
+    geocode_sample_locations()) and records that only reached their town's centroid
+    (tagged "<town> Centroid", a lower-precision fallback). Centroid-geocoded records
+    still count toward the public map's town/analyte statistics - this report exists so a
+    privileged user can review geocoding precision, not to flag records as excluded from
+    publish. Includes every field on points_feature_class, plus the point's
+    longitude/latitude and a plain-language GeocodeOutcome column. Returns a pandas
+    DataFrame ready to be written out as a CSV, with one row per record that failed to
+    geocode or only reached centroid precision.
+    """
+    attribute_field_names = [
+        field.name for field in arcpy.ListFields(points_feature_class)
+        if field.type not in ("Geometry", "Blob", "Raster")
+    ]
+    cursor_fields = attribute_field_names + ["SHAPE@X", "SHAPE@Y"]
+    with arcpy.da.SearchCursor(points_feature_class, cursor_fields) as cursor:
+        records = list(cursor)
+    report_df = pd.DataFrame.from_records(records, columns=attribute_field_names + ["Longitude", "Latitude"])
+
+    concat_address_text = report_df["ConcatAddress"].astype("string")
+    is_geocode_excluded = concat_address_text.str.startswith(GEOCODE_EXCLUSION_MARKER_PREFIX, na=False)
+    is_centroid_only = concat_address_text.str.endswith(" Centroid", na=False)
+
+    report_df["GeocodeOutcome"] = pd.NA
+    report_df.loc[concat_address_text == GEOCODE_EXCLUSION_OUT_OF_STATE_MARKER, "GeocodeOutcome"] = \
+        "Out-of-state address, not attempted"
+    report_df.loc[concat_address_text == GEOCODE_EXCLUSION_NOT_GEOCODED_MARKER, "GeocodeOutcome"] = \
+        "Address could not be geocoded"
+    report_df.loc[is_centroid_only, "GeocodeOutcome"] = \
+        "Geocoded to town centroid only (reduced spatial precision)"
+
+    excluded_df = report_df.loc[is_geocode_excluded | is_centroid_only].reset_index(drop=True)
+    return excluded_df
+
+
+def publish_excluded_records_report_to_agol(report_df, ago_username, ago_password):
+    """
+    Uploads the excluded-records report to ArcGIS Online as a CSV item, in the same
+    AGOL folder as the pivoted CSV export, so privileged users can
+    find and download it from AGOL Content without needing any new map or app widget. If
+    the item doesn't exist yet, this creates it and shares it the same way the existing
+    pivoted CSV item is shared; otherwise it just replaces the data. This step is not
+    critical to the data pipeline, so any failure here is caught, printed as a warning,
+    and doesn't stop the rest of the script.
+    """
+    temp_dir = tempfile.gettempdir()
+    csv_path = os.path.join(temp_dir, f"{EXCLUDED_RECORDS_REPORT_ITEM_TITLE}.csv")
+    zip_path = os.path.join(temp_dir, f"{EXCLUDED_RECORDS_REPORT_ITEM_TITLE}.zip")
+
+    try:
+        report_df.to_csv(csv_path, index=False, encoding="utf-8")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            zip_file.write(csv_path, arcname=os.path.basename(csv_path))
+
+        gis = GIS(AGOL_PORTAL_URL, username=ago_username, password=ago_password)
+        search_results = gis.content.search(
+            query=f'title:"{EXCLUDED_RECORDS_REPORT_ITEM_TITLE}" AND owner:{gis.users.me.username}', item_type="CSV")
+        existing_item = next((item for item in search_results if item.title == EXCLUDED_RECORDS_REPORT_ITEM_TITLE), None)
+
+        if existing_item is not None:
+            existing_item.update(data=zip_path)
+            print(f"Excluded-records report updated ({len(report_df)} records) in ArcGIS Online.")
+            return
+
+        # First run - the item doesn't exist yet. Create it in the same folder as, and
+        # share it the same way as, the pivoted CSV export, so it lands somewhere
+        # privileged users already know to look.
+        reference_item = next(
+            (item for item in gis.content.search(
+                query=f'title:"{PIVOTED_CSV_ITEM_TITLE}" AND owner:{gis.users.me.username}', item_type="CSV")
+             if item.title == PIVOTED_CSV_ITEM_TITLE), None)
+
+        # gis.content.add(..., folder=...) is deprecated in this version of the arcgis
+        # package (and removed entirely in 3.0) - it silently mishandled the old-style
+        # {"type": "CSV"} key (the modern API wants "item_type") and crashed with a
+        # confusing "can only concatenate str (not NoneType) to str" error the first time
+        # this code path actually ran for real. The modern replacement gets the folder as
+        # its own object and adds to it directly, and returns a Job rather than the item
+        # itself, so the actual Item has to be pulled out with .result().
+        folder_obj = gis.content.folders.get(folder=PIVOTED_CSV_FOLDER_NAME, owner=gis.users.me.username)
+        if folder_obj is None:
+            raise RuntimeError(
+                f"Could not find an AGOL folder named '{PIVOTED_CSV_FOLDER_NAME}' "
+                f"owned by {gis.users.me.username}."
+            )
+        item_properties = ItemProperties(title=EXCLUDED_RECORDS_REPORT_ITEM_TITLE, item_type=ItemTypeEnum.CSV.value)
+        add_job = folder_obj.add(item_properties=item_properties, file=zip_path)
+        new_item = add_job.result()
+
+        if reference_item is not None:
+            # reference_item.sharing.groups is a manager object, not a list - call
+            # .list() to get the actual Group objects, then share with each one
+            # individually, since .add() only accepts a single group at a time.
+            for group in reference_item.sharing.groups.list():
+                new_item.sharing.groups.add(group=group)
+
+        print(f"Excluded-records report created ({len(report_df)} records) in ArcGIS Online.")
+
+    except Exception as error:
+        print(f"Warning: failed to publish the excluded-records report to ArcGIS Online: {error}")
+
+    finally:
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+
+
+# =====================================================================================
+# MAIN - runs every step in order.
+# =====================================================================================
+
+def main():
+    ago_username, ago_password = read_comma_separated_credentials_file(AGO_CREDS_FILE)
+
+    # Step 1: mirror raw lab results into SDE.
+    # Updates: RAW_DATA_TABLE (GroundwaterChemistry_GWCDrawdata) -> feeds the
+    # "Raw Data (GWCD) - Internal" layer in the Internal experience. No other
+    # application reads this table.
+    refresh_raw_data_table(SQL_SOURCE_TABLE, RAW_DATA_TABLE, SQL_TO_SDE_FIELD_MAP)
+
+    raw_data_memory_table = "memory/GroundwaterChemistry_GWCDrawdataCleaned"
+    arcpy.conversion.TableToTable(RAW_DATA_TABLE, "memory", "GroundwaterChemistry_GWCDrawdataCleaned")
+
+    # Step 2: weekly exceedance alert email (runs against the raw, not-yet-geocoded data).
+    # Updates: nothing in SDE or AGOL - sends an email to EMAIL_RECIPIENTS. Does not
+    # touch any table or application.
+    run_weekly_exceedance_alert(raw_data_memory_table, EMAIL_SENDER, EMAIL_RECIPIENTS)
+
+    # Step 3: clean up and geocode sample locations.
+    # Updates: nothing yet - builds an in-memory intermediate table only. Nothing is
+    # published to any live table or application until Step 5.
+    joined_points = clean_and_geocode_points(raw_data_memory_table, TOWN_ALIAS_TABLE, TOWN_BOUNDARIES)
+
+    # Step 4: calculate exceedances, de-duplicate, and summarize by town/analyte.
+    # Updates: nothing yet - still an in-memory intermediate table.
+    record_filter_clause = build_published_record_filter_clause()
+    calculated_points = calculate_exceedances_and_summaries(joined_points, record_filter_clause, EXCEEDANCE_THRESHOLDS_BY_ANALYTE)
+
+    # Step 5a: publish the full (internal) points to SDE.
+    # Updates: POINTS_FEATURE_CLASS (GroundwaterChemistry_GWCDPoints) -> feeds the
+    # "Geocoded GWCD Points - Internal" layer in the Internal experience, and is the
+    # source table for the pivoted CSV (Step 7) and excluded-records report (Step 8).
+    arcpy.management.SelectLayerByAttribute(calculated_points, "CLEAR_SELECTION")
+    arcpy.management.DeleteFeatures(POINTS_FEATURE_CLASS)
+    arcpy.management.Append(calculated_points, POINTS_FEATURE_CLASS, "NO_TEST")
+
+    # Step 5b: build and publish the flattened, suppressed, public summary table.
+    # Updates: EXTERNAL_PUBLIC_TABLE (GroundwaterChemistry_GWCDPointTableExternal) ->
+    # feeds BOTH the "Analyte Data - External" layer in the Internal experience AND the
+    # live public ArcGIS Server service behind the Public experience's "Private
+    # Drinking Water Quality" page. That public service has no caching, so this is the
+    # one step whose effects reach the public within one request.
+    flattened_public_table = build_external_public_table(calculated_points, record_filter_clause)
+    add_map_popup_text(flattened_public_table, PUBLIC_MAP_ANALYTE_SETTINGS)
+
+    arcpy.management.DeleteRows(EXTERNAL_PUBLIC_TABLE)
+    arcpy.management.Append(flattened_public_table, EXTERNAL_PUBLIC_TABLE, "NO_TEST")
+
+    # Updates: no data changes - just rebuilds indexes on the three tables just written,
+    # since large deletes/appends can leave them fragmented.
+    rebuild_table_indexes(GIS_EDITOR_CONNECTION, [RAW_DATA_TABLE, POINTS_FEATURE_CLASS, EXTERNAL_PUBLIC_TABLE])
+
+    # Step 6: update the "data last refreshed" date on SharePoint.
+    # Updates: the "LatestDataUpdate" field on the Groundwater Chemistry SharePoint list
+    # item (AHS.GISAdministrationGroup site). Not read by either experience directly.
+    azure_client_id, azure_client_secret, azure_tenant_id = read_comma_separated_credentials_file(AZURE_CREDS_FILE)
+    update_sharepoint_last_updated_date(
+        azure_client_id, azure_client_secret, azure_tenant_id,
+        SHAREPOINT_SITE_URL, SHAREPOINT_LIST_ID, SHAREPOINT_APPLICATION_DOMAIN)
+
+    # Step 7: republish the pivoted CSV export to ArcGIS Online.
+    # Updates: the "PivotedGroundwaterData" AGOL CSV item
+    # (AHS_VDH_EnvHealth_GroundwaterInternal folder) - internal analysis export only,
+    # not used by either experience.
+    publish_pivoted_csv_to_agol(POINTS_FEATURE_CLASS, ago_username, ago_password)
+
+    # Step 8: characterize every record that didn't geocode cleanly and publish that
+    # report too.
+    # Updates: the "GroundwaterChemistry_ExcludedRecords" AGOL CSV item
+    # (AHS_VDH_EnvHealth_GroundwaterInternal folder) - internal review export only, not
+    # used by either experience.
+    excluded_records_report = generate_excluded_records_report(POINTS_FEATURE_CLASS)
+    publish_excluded_records_report_to_agol(excluded_records_report, ago_username, ago_password)
+
+
+if __name__ == "__main__":
+    main()
